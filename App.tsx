@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Arete, EstadoArete, Tab, Lote } from './types';
-import { StorageService } from './services/storageService'; 
+import { SupabaseService } from './services/supabaseService'; // Cambiado a Supabase
+import { supabase } from './services/supabaseClient'; // Cliente para Realtime
 import Scanner from './components/Scanner';
 import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
@@ -34,20 +35,20 @@ const App: React.FC = () => {
     confirmText?: string;
   }>({ isOpen: false, type: 'alert', title: '', message: '' });
 
-  // Load initial data
+  // 1. CARGA INICIAL DE DATOS DESDE SUPABASE
   useEffect(() => {
     const loadData = async () => {
       setIsLoadingData(true);
       try {
         const [aretesData, lotesData] = await Promise.all([
-          StorageService.obtenerAretes(),
-          StorageService.obtenerLotes()
+          SupabaseService.obtenerAretes(),
+          SupabaseService.obtenerLotes()
         ]);
         
         setAretes(aretesData);
         setLotes(lotesData);
         
-        // Auto-selection logic
+        // Auto-selección inteligente
         if (!activeLoteId) {
           const ultimoAbierto = lotesData.find(l => !l.cerrado);
           
@@ -61,12 +62,12 @@ const App: React.FC = () => {
           }
         }
       } catch (e) {
-        console.error("Error cargando datos", e);
+        console.error("Error cargando datos de la nube", e);
         setAlertConfig({
             isOpen: true,
             type: 'alert',
-            title: 'Error',
-            message: 'Hubo un problema cargando los datos locales.'
+            title: 'Error de Conexión',
+            message: 'No se pudieron cargar los datos de la nube. Revisa tu internet.'
         });
       } finally {
         setIsLoadingData(false);
@@ -74,7 +75,71 @@ const App: React.FC = () => {
     };
 
     loadData();
-  }, []);
+
+    // 2. CONFIGURACIÓN DE REALTIME (SINCRONIZACIÓN)
+    // Escuchamos cambios en la base de datos para actualizar la UI al instante
+    const channel = supabase.channel('cambios-globales')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'aretes' },
+        (payload) => {
+          // Manejar cambios en ARETES
+          if (payload.eventType === 'INSERT') {
+            const newRow = payload.new;
+            const newArete: Arete = {
+              id: newRow.id,
+              codigo: newRow.codigo,
+              fechaEscaneo: newRow.fecha_escaneo,
+              estado: newRow.estado as EstadoArete,
+              loteId: newRow.lote_id,
+              notas: newRow.notas
+            };
+            setAretes(prev => [newArete, ...prev]);
+            if (navigator.vibrate) navigator.vibrate(50); // Pequeña vibración al recibir datos remotos
+          } else if (payload.eventType === 'UPDATE') {
+             const updatedRow = payload.new;
+             setAretes(prev => prev.map(a => a.id === updatedRow.id ? {
+                ...a,
+                estado: updatedRow.estado as EstadoArete,
+                notas: updatedRow.notas,
+                loteId: updatedRow.lote_id
+             } : a));
+          } else if (payload.eventType === 'DELETE') {
+             setAretes(prev => prev.filter(a => a.id !== payload.old.id));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'lotes' },
+        (payload) => {
+          // Manejar cambios en LOTES (Cierre/Apertura/Creación)
+          if (payload.eventType === 'INSERT') {
+             const newRow = payload.new;
+             const newLote: Lote = {
+                id: newRow.id,
+                nombre: newRow.nombre,
+                fechaCreacion: newRow.fecha_creacion,
+                cerrado: newRow.cerrado
+             };
+             setLotes(prev => [newLote, ...prev]);
+          } else if (payload.eventType === 'UPDATE') {
+             const updatedRow = payload.new;
+             setLotes(prev => prev.map(l => l.id === updatedRow.id ? {
+                ...l,
+                cerrado: updatedRow.cerrado,
+                nombre: updatedRow.nombre
+             } : l));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+
+  }, []); // Se ejecuta solo al montar
 
   // --- LÓGICA DE LOTES ---
 
@@ -96,21 +161,24 @@ const App: React.FC = () => {
     setShowCreateModal(true);
   };
 
-  // Handler para EJECUTAR la creación (desde el modal)
+  // Handler para EJECUTAR la creación
   const executeCreateLote = async () => {
     if (!createName.trim()) return;
     
     try {
       // Cerrar lote anterior si existe
       if (activeLote && !activeLote.cerrado) {
-        await StorageService.actualizarEstadoLote(activeLote.id, true);
-        setLotes(prev => prev.map(l => l.id === activeLote.id ? { ...l, cerrado: true } : l));
+        await SupabaseService.actualizarEstadoLote(activeLote.id, true);
+        // La actualización de estado local se maneja vía Realtime, pero podemos hacerlo optimista
       }
 
-      const nuevoLote = await StorageService.crearLote(createName);
-      setLotes(prev => [nuevoLote, ...prev]);
-      setActiveLoteId(nuevoLote.id);
-      setActiveTab('lista');
+      const nuevoLote = await SupabaseService.crearLote(createName);
+      if (nuevoLote) {
+        // No necesitamos setLotes manual si el Realtime funciona rápido, 
+        // pero para la selección del ID activo, lo hacemos aquí:
+        setActiveLoteId(nuevoLote.id);
+        setActiveTab('lista');
+      }
       setShowCreateModal(false);
     } catch (e) {
       console.error(e);
@@ -135,8 +203,8 @@ const App: React.FC = () => {
         confirmText: accion === "CERRAR" ? "Sí, Cerrar" : "Sí, Reabrir",
         isDestructive: accion === "CERRAR",
         onConfirm: async () => {
-           await StorageService.actualizarEstadoLote(lote.id, nuevoEstadoCerrado);
-           setLotes(prev => prev.map(l => l.id === lote.id ? { ...l, cerrado: nuevoEstadoCerrado } : l));
+           await SupabaseService.actualizarEstadoLote(lote.id, nuevoEstadoCerrado);
+           // La UI se actualiza vía suscripción Realtime
            
            if (!nuevoEstadoCerrado) {
              setActiveLoteId(lote.id);
@@ -190,26 +258,20 @@ const App: React.FC = () => {
       return;
     }
 
-    await StorageService.guardarArete(decodedText, activeLoteId);
+    // Guardar en Supabase. El arete aparecerá en la lista gracias a la suscripción Realtime.
+    await SupabaseService.guardarArete(decodedText, activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId);
     
-    const nuevoArete: Arete = {
-        id: crypto.randomUUID(), 
-        codigo: decodedText,
-        fechaEscaneo: new Date().toISOString(),
-        estado: EstadoArete.PENDIENTE,
-        loteId: activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId
-    };
-    setAretes(prev => [nuevoArete, ...prev]);
-    setActiveTab('lista');
-    
+    // Feedback inmediato
     if (navigator.vibrate) navigator.vibrate(200);
+    setActiveTab('lista');
   };
 
   // --- GESTIÓN DE ARETES ---
 
   const handleUpdateStatus = async (id: string, status: EstadoArete) => {
+    // Actualización optimista para UX
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
-    await StorageService.actualizarEstado(id, status);
+    await SupabaseService.actualizarEstado(id, status);
   };
 
   const handleDelete = (id: string) => {
@@ -217,12 +279,13 @@ const App: React.FC = () => {
         isOpen: true,
         type: 'confirm',
         title: '¿Eliminar arete?',
-        message: 'Esta acción eliminará el registro de la lista. ¿Continuar?',
+        message: 'Esta acción eliminará el registro de la base de datos para todos. ¿Continuar?',
         isDestructive: true,
         confirmText: 'Eliminar',
         onConfirm: async () => {
+            // Actualización optimista
             setAretes(prev => prev.filter(a => a.id !== id));
-            await StorageService.eliminarArete(id);
+            await SupabaseService.eliminarArete(id);
             setAlertConfig(prev => ({ ...prev, isOpen: false }));
         }
     });
@@ -262,7 +325,7 @@ const App: React.FC = () => {
               <ScanLine className="text-emerald-300" />
               <div className="flex flex-col leading-none">
                  <span className="text-sm font-bold text-white">SINIIGA</span>
-                 <span className="text-[10px] text-emerald-200">Cloud</span>
+                 <span className="text-[10px] text-emerald-200">Cloud Sync</span>
               </div>
             </div>
           </div>
