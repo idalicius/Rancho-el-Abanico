@@ -1,41 +1,32 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Arete, EstadoArete, Tab } from './types';
 import { SupabaseService } from './services/supabaseService';
 import { supabase } from './services/supabaseClient';
-import { GeminiService } from './services/geminiService';
 import Scanner from './components/Scanner';
 import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
 import Stats from './components/Stats';
-import { ScanLine, List, BarChart3, Bot, Search, Trash, Wifi, RefreshCw } from 'lucide-react';
+import { ScanLine, List, CalendarRange, Search, Trash, Wifi, RefreshCw, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('lista');
   const [aretes, setAretes] = useState<Arete[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
-  const [aiReport, setAiReport] = useState<string>('');
-  const [loadingAi, setLoadingAi] = useState(false);
   const [isLoadingData, setIsLoadingData] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
 
   // Load initial data and Setup Realtime Subscription
   useEffect(() => {
-    // Función para cargar datos. 
-    // 'silent' es true cuando es una actualización automática de fondo para no mostrar el spinner grande.
     const loadData = async (silent = false) => {
       if (!silent) setIsLoadingData(true);
-      
       const data = await SupabaseService.obtenerAretes();
       setAretes(data);
-      
       if (!silent) setIsLoadingData(false);
     };
 
-    // Carga inicial
     loadData();
 
-    // Configuración de Realtime (Suscripción a cambios)
     const channel = supabase
       .channel('cambios_aretes')
       .on(
@@ -43,13 +34,10 @@ const App: React.FC = () => {
         { event: '*', schema: 'public', table: 'aretes' },
         (payload) => {
           console.log('Cambio detectado en tiempo real:', payload);
-          // Recargamos silenciosamente para que aparezca mágicamente en la pantalla
           loadData(true);
           
-          // Efecto de sonido sutil opcional para la laptop (Dashboard)
-          // Solo si no estamos escaneando activamente (para no duplicar sonido en el móvil)
           if (document.hidden || activeTab === 'lista') {
-             // Un sonido muy suave o nada. Dejaremos que la UI hable.
+             // Sonido opcional
           }
         }
       )
@@ -60,32 +48,39 @@ const App: React.FC = () => {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []); // Dependencias vacías para correr solo al montar
+  }, []);
 
   const handleScan = async (decodedText: string) => {
-    // 1. Guardar en Supabase (Async)
+    // 1. VALIDACIÓN DE DUPLICADOS
+    const existe = aretes.find(a => a.codigo === decodedText);
+
+    if (existe) {
+      // Alerta al usuario
+      alert(`⚠️ DUPLICADO DETECTADO\n\nEl arete ${decodedText} ya fue escaneado el ${new Date(existe.fechaEscaneo).toLocaleDateString('es-MX')}.`);
+      
+      // Cerrar escáner inmediatamente
+      setActiveTab('lista');
+      return; // Detener ejecución, no guardar
+    }
+
+    // 2. Guardar en Supabase (si no es duplicado)
     await SupabaseService.guardarArete(decodedText);
     
-    // 2. Cerrar el escáner inmediatamente
+    // 3. Cerrar el escáner
     setActiveTab('lista');
     
-    // Opcional: Vibración del celular para confirmar
     if (navigator.vibrate) {
       navigator.vibrate(200);
     }
   };
 
   const handleUpdateStatus = async (id: string, status: EstadoArete) => {
-    // Optimista: Actualizamos la UI inmediatamente antes de que el servidor responda
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
-    
-    // Enviamos a Supabase
     await SupabaseService.actualizarEstado(id, status);
   };
 
   const handleDelete = async (id: string) => {
     if(confirm('¿Estás seguro de eliminar este registro de la base de datos?')) {
-      // Optimista
       setAretes(prev => prev.filter(a => a.id !== id));
       await SupabaseService.eliminarArete(id);
     }
@@ -93,22 +88,34 @@ const App: React.FC = () => {
 
   const handleClearAll = async () => {
     if(confirm('PELIGRO: Esto borrará TODOS los aretes de la base de datos para TODOS los usuarios. ¿Continuar?')) {
-      // Optimista
       setAretes([]);
       await SupabaseService.limpiarTodo();
     }
   };
 
-  const generateAiAnalysis = async () => {
-    setLoadingAi(true);
-    const report = await GeminiService.analizarLote(aretes);
-    setAiReport(report);
-    setLoadingAi(false);
-  };
-
   const filteredAretes = aretes.filter(a => 
     a.codigo.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  // Agrupación para el reporte por fechas
+  const reportePorFecha = useMemo(() => {
+    const grupos: Record<string, Arete[]> = {};
+    
+    aretes.forEach(arete => {
+      const fecha = new Date(arete.fechaEscaneo).toLocaleDateString('es-MX', { 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric' 
+      });
+      if (!grupos[fecha]) grupos[fecha] = [];
+      grupos[fecha].push(arete);
+    });
+
+    return Object.entries(grupos).sort((a, b) => {
+      // Ordenar por fecha descendente (asumiendo que los aretes ya vienen ordenados o usando el primer elemento)
+      return new Date(b[1][0].fechaEscaneo).getTime() - new Date(a[1][0].fechaEscaneo).getTime();
+    });
+  }, [aretes]);
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col max-w-2xl mx-auto shadow-2xl">
@@ -150,7 +157,7 @@ const App: React.FC = () => {
             <p className="text-sm text-slate-500 text-center max-w-xs">
               Apunta la cámara al código de barras. 
               <br/>
-              <span className="font-semibold text-emerald-600">Se guardará en la nube automáticamente.</span>
+              <span className="font-semibold text-emerald-600">El sistema cerrará el escáner automáticamente.</span>
             </p>
           </div>
         )}
@@ -214,39 +221,64 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {/* VIEW: ANALYSIS (GEMINI) */}
+        {/* VIEW: REPORT BY DATE */}
         {activeTab === 'analisis' && (
           <div className="space-y-6">
-            <div className="bg-gradient-to-br from-indigo-600 to-violet-700 text-white p-6 rounded-2xl shadow-lg">
-              <div className="flex items-center gap-3 mb-4">
-                <Bot size={32} className="text-indigo-200" />
-                <h2 className="text-2xl font-bold">Asistente IA</h2>
-              </div>
-              <p className="text-indigo-100 mb-6">
-                Analiza los datos sincronizados en la nube para detectar inconsistencias o preparar tu reporte SINIIGA.
-              </p>
-              <button 
-                onClick={generateAiAnalysis}
-                disabled={loadingAi}
-                className="w-full bg-white text-indigo-700 font-bold py-3 rounded-xl shadow hover:bg-indigo-50 transition-colors disabled:opacity-50"
-              >
-                {loadingAi ? 'Analizando...' : 'Generar Reporte Inteligente'}
-              </button>
-            </div>
-
-            {aiReport && (
-              <div className="bg-white p-6 rounded-xl shadow-md border border-slate-100 prose prose-slate max-w-none">
-                <h3 className="text-lg font-bold text-slate-800 mb-2 border-b pb-2">Reporte Generado</h3>
-                <div className="whitespace-pre-line text-slate-600">
-                  {aiReport}
+            <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100">
+              <div className="flex items-center gap-3 mb-6 border-b pb-4 border-slate-100">
+                <div className="bg-violet-100 p-2 rounded-lg">
+                  <CalendarRange size={24} className="text-violet-600" />
                 </div>
+                <h2 className="text-xl font-bold text-slate-800">Reporte Histórico</h2>
               </div>
-            )}
+
+              {reportePorFecha.length === 0 ? (
+                <p className="text-center text-slate-400 py-8">No hay datos para mostrar.</p>
+              ) : (
+                <div className="space-y-6">
+                  {reportePorFecha.map(([fecha, items]) => {
+                    const confirmados = items.filter(i => i.estado === EstadoArete.ALTA_CONFIRMADA).length;
+                    const pendientes = items.filter(i => i.estado === EstadoArete.PENDIENTE).length;
+                    const bajas = items.filter(i => i.estado === EstadoArete.BAJA).length;
+                    const noReg = items.filter(i => i.estado === EstadoArete.NO_REGISTRADO).length;
+
+                    return (
+                      <div key={fecha} className="border border-slate-200 rounded-xl overflow-hidden">
+                        <div className="bg-slate-50 p-3 flex justify-between items-center border-b border-slate-200">
+                           <h3 className="font-bold text-slate-700 capitalize">{fecha}</h3>
+                           <span className="bg-white px-2 py-1 rounded text-xs font-bold text-slate-600 border shadow-sm">
+                             {items.length} Total
+                           </span>
+                        </div>
+                        <div className="p-4 grid grid-cols-2 gap-4 text-sm">
+                           <div className="flex items-center gap-2 text-green-700">
+                              <CheckCircle2 size={16} />
+                              <span>{confirmados} Altas</span>
+                           </div>
+                           <div className="flex items-center gap-2 text-slate-500">
+                              <div className="w-4 h-4 rounded-full border-2 border-slate-300"></div>
+                              <span>{pendientes} Pendientes</span>
+                           </div>
+                           <div className="flex items-center gap-2 text-red-600">
+                              <XCircle size={16} />
+                              <span>{noReg} No Reg.</span>
+                           </div>
+                           <div className="flex items-center gap-2 text-yellow-600">
+                              <AlertTriangle size={16} />
+                              <span>{bajas} Bajas</span>
+                           </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
             
-            {!aiReport && !loadingAi && (
-               <div className="text-center text-slate-400 mt-10">
-                  <p>Presiona el botón para analizar tus datos.</p>
-               </div>
+            {aretes.length > 0 && (
+                <div className="flex justify-center">
+                    <ExportButton aretes={aretes} />
+                </div>
             )}
           </div>
         )}
@@ -274,7 +306,7 @@ const App: React.FC = () => {
           onClick={() => setActiveTab('analisis')}
           className={`flex flex-col items-center p-2 rounded-lg transition-all ${activeTab === 'analisis' ? 'text-violet-600 bg-violet-50' : 'text-slate-400'}`}
         >
-          <BarChart3 size={24} />
+          <CalendarRange size={24} />
           <span className="text-xs font-medium mt-1">Reporte</span>
         </button>
       </nav>
