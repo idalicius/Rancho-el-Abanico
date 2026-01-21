@@ -1,0 +1,7 @@
+{
+  "name": "GanadoScan SINIIGA",
+  "description": "Aplicación para el escaneo, control y gestión de aretes de ganado (SINIIGA) con soporte de IA.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
