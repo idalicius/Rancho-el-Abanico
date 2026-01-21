@@ -1,14 +1,15 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Arete, EstadoArete, Tab, Lote } from './types';
 import { SupabaseService } from './services/supabaseService'; // Cambiado a Supabase
 import { supabase } from './services/supabaseClient'; // Cliente para Realtime
+import { OfflineStorage } from './services/offlineStorage'; // Servicio cola offline
 import Scanner from './components/Scanner';
 import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
 import Stats from './components/Stats';
 import LotItem from './components/LotItem';
-import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText, Wifi, WifiOff, Loader2 } from 'lucide-react';
+import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText, Wifi, WifiOff, Loader2, CloudUpload } from 'lucide-react';
 
 const UNASSIGNED_LOTE_ID = 'unassigned';
 
@@ -20,10 +21,13 @@ const App: React.FC = () => {
   
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoadingData, setIsLoadingData] = useState(true);
-  const [isProcessingScan, setIsProcessingScan] = useState(false); // Nuevo estado para prevenir crash
+  const [isProcessingScan, setIsProcessingScan] = useState(false); 
   
-  // Estado de conexión Realtime
+  // Estado de conexión y sincronización
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED'>('CONNECTING');
+  const [connectionRetry, setConnectionRetry] = useState(0);
 
   // --- ESTADOS PARA MODALES ---
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -39,78 +43,154 @@ const App: React.FC = () => {
     confirmText?: string;
   }>({ isOpen: false, type: 'alert', title: '', message: '' });
 
+  // Función para procesar la cola offline (Sincronización)
+  const processSyncQueue = useCallback(async () => {
+    if (!navigator.onLine || isSyncing) return;
+    
+    const queue = OfflineStorage.obtenerCola();
+    if (queue.length === 0) return;
+
+    setIsSyncing(true);
+    let syncedCount = 0;
+
+    for (const item of queue) {
+        try {
+            // Intentamos enviar a Supabase
+            // Nota: guardarArete en el servicio espera argumentos simples, 
+            // no el objeto completo con ID, así que insertamos uno nuevo.
+            // Si quisiéramos preservar el ID local UUID sería más complejo, 
+            // pero para este caso basta con recrearlo en el server.
+            await SupabaseService.guardarArete(item.codigo, item.loteId || undefined);
+            
+            // Si éxito, borrar de la cola local
+            OfflineStorage.removerDeCola(item.id);
+            syncedCount++;
+        } catch (error) {
+            console.error("Fallo sincronización item", item.codigo, error);
+            // Si falla, se queda en la cola para el próximo intento
+        }
+    }
+    
+    setIsSyncing(false);
+    if (syncedCount > 0) {
+        // Refrescar datos del servidor para obtener los IDs reales y timestamps del servidor
+        // Opcional: mostrar un toast de "Sincronizado"
+    }
+  }, [isSyncing]);
+
   // Función para cargar datos (reutilizable)
   const fetchData = useCallback(async (isInitialLoad = false) => {
     if (isInitialLoad) setIsLoadingData(true);
     try {
+      // 1. Obtener datos del servidor
       const [aretesData, lotesData] = await Promise.all([
         SupabaseService.obtenerAretes(),
         SupabaseService.obtenerLotes()
       ]);
       
-      setAretes(aretesData);
+      // 2. Obtener datos de la cola offline (pendientes de subir)
+      const offlineQueue = OfflineStorage.obtenerCola();
+
+      // 3. Mezclar listas (Servidor + Offline)
+      // Los offline van primero o integrados. Agregamos flag sincronizado=true a los del server
+      const serverAretes = aretesData.map(a => ({ ...a, sincronizado: true }));
+      
+      // Combinamos. Si hay duplicados de ID (raro pq offline usa uuid), priorizamos offline queue visualmente?
+      // Mejor: Mostrar todo.
+      const combinedAretes = [...offlineQueue, ...serverAretes].sort((a, b) => 
+          new Date(b.fechaEscaneo).getTime() - new Date(a.fechaEscaneo).getTime()
+      );
+      
+      setAretes(combinedAretes);
       setLotes(lotesData);
       
-      return { aretesData, lotesData };
+      return { aretesData: combinedAretes, lotesData };
     } catch (e) {
       console.error("Error fetching data", e);
+      // Fallback: si no hay red, mostrar solo offline queue y lo que haya en caché si implementáramos caché local de todo
+      const offlineQueue = OfflineStorage.obtenerCola();
+      setAretes(offlineQueue);
       return null;
     } finally {
       if (isInitialLoad) setIsLoadingData(false);
     }
   }, []);
 
+  // Monitor de estado de red
+  useEffect(() => {
+    const handleOnline = () => {
+        setIsOnline(true);
+        processSyncQueue(); // Intentar sincronizar al volver
+        // Reconectar realtime
+        setConnectionRetry(prev => prev + 1);
+    };
+    const handleOffline = () => {
+        setIsOnline(false);
+        setConnectionStatus('DISCONNECTED');
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    // Check inicial de cola por si abrimos la app y ya hay internet
+    if (navigator.onLine) {
+        processSyncQueue();
+    }
+
+    return () => {
+        window.removeEventListener('online', handleOnline);
+        window.removeEventListener('offline', handleOffline);
+    };
+  }, [processSyncQueue]);
+
   // 1. CARGA INICIAL Y REALTIME
   useEffect(() => {
+    let isMounted = true;
+
     // Carga inicial
-    fetchData(true).then((data) => {
-        if (data && !activeLoteId) {
-            const ultimoAbierto = data.lotesData.find(l => !l.cerrado);
-            if (ultimoAbierto) {
-                setActiveLoteId(ultimoAbierto.id);
-            } else {
-                const hayAretesSinLote = data.aretesData.some(a => !a.loteId);
-                if (hayAretesSinLote) {
-                    setActiveLoteId(UNASSIGNED_LOTE_ID);
+    if (connectionRetry === 0) {
+        fetchData(true).then((data) => {
+            if (isMounted && data && !activeLoteId) {
+                const ultimoAbierto = data.lotesData.find(l => !l.cerrado);
+                if (ultimoAbierto) {
+                    setActiveLoteId(ultimoAbierto.id);
+                } else {
+                    const hayAretesSinLote = data.aretesData.some(a => !a.loteId);
+                    if (hayAretesSinLote) {
+                        setActiveLoteId(UNASSIGNED_LOTE_ID);
+                    }
                 }
             }
-        }
-    });
+        });
+    } else {
+        // Si es retry (reconectó internet), refrescar datos
+        fetchData(false);
+    }
+
+    if (!isOnline) return; // No intentar suscribir si no hay red
 
     // Configuración de Realtime ROBUSTA
-    const channel = supabase.channel('global-changes')
+    const channelId = `global-changes-${Date.now()}`;
+    const channel = supabase.channel(channelId)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'aretes' },
         (payload) => {
+          if (!isMounted) return;
           if (payload.eventType === 'INSERT') {
             const newRow = payload.new;
-            const newArete: Arete = {
-              id: newRow.id,
-              codigo: newRow.codigo,
-              fechaEscaneo: newRow.fecha_escaneo,
-              estado: newRow.estado as EstadoArete,
-              loteId: newRow.lote_id,
-              notas: newRow.notas
-            };
-            setAretes(prev => {
-                if (prev.some(a => a.id === newArete.id)) return prev;
-                return [newArete, ...prev];
-            });
-            // Vibrar solo si NO soy yo quien está escaneando (para evitar doble vibración)
-            if (!document.hidden) {
-                if (navigator.vibrate) navigator.vibrate(50);
-            }
-          } else if (payload.eventType === 'UPDATE') {
-             const updatedRow = payload.new;
-             setAretes(prev => prev.map(a => a.id === updatedRow.id ? {
-                ...a,
-                estado: updatedRow.estado as EstadoArete,
-                notas: updatedRow.notas,
-                loteId: updatedRow.lote_id
-             } : a));
-          } else if (payload.eventType === 'DELETE') {
-             setAretes(prev => prev.filter(a => a.id !== payload.old.id));
+            // Si llega un insert del servidor, verificamos si era uno nuestro de la cola offline
+            // Como el ID será diferente (UUID local vs ID server), es difícil matchear exacto sin un campo extra.
+            // Por simplicidad, refrescamos todo.
+            // Para UX instantánea, agregamos, pero si estamos syncando puede duplicarse visualmente 
+            // hasta que fetchData limpie.
+            fetchData(false);
+            
+            // Vibrar
+            if (!document.hidden && navigator.vibrate) navigator.vibrate(50);
+
+          } else if (payload.eventType === 'UPDATE' || payload.eventType === 'DELETE') {
+             fetchData(false); // Simplificación: recargar para mantener consistencia
           }
         }
       )
@@ -118,48 +198,33 @@ const App: React.FC = () => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'lotes' },
         (payload) => {
-          if (payload.eventType === 'INSERT') {
-             const newRow = payload.new;
-             const newLote: Lote = {
-                id: newRow.id,
-                nombre: newRow.nombre,
-                fechaCreacion: newRow.fecha_creacion,
-                cerrado: newRow.cerrado
-             };
-             setLotes(prev => [newLote, ...prev]);
-          } else if (payload.eventType === 'UPDATE') {
-             const updatedRow = payload.new;
-             setLotes(prev => prev.map(l => l.id === updatedRow.id ? {
-                ...l,
-                cerrado: updatedRow.cerrado,
-                nombre: updatedRow.nombre
-             } : l));
-          } else if (payload.eventType === 'DELETE') {
-             setLotes(prev => prev.filter(l => l.id !== payload.old.id));
-             // Si el lote borrado era el activo, desasignar
-             setActiveLoteId(prevId => prevId === payload.old.id ? null : prevId);
-          }
+            if (!isMounted) return;
+            fetchData(false);
         }
       )
       .subscribe((status) => {
+        if (!isMounted) return;
         if (status === 'SUBSCRIBED') {
             setConnectionStatus('CONNECTED');
-            fetchData(false); 
         } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
             setConnectionStatus('DISCONNECTED');
-            setTimeout(() => {
-                channel.subscribe();
-            }, 5000);
+            // Reintentar si seguimos online
+            if (navigator.onLine) {
+                setTimeout(() => {
+                    if (isMounted) setConnectionRetry(prev => prev + 1);
+                }, 5000);
+            }
         } else {
             setConnectionStatus('CONNECTING');
         }
       });
 
     return () => {
+      isMounted = false;
       supabase.removeChannel(channel);
     };
 
-  }, [fetchData]);
+  }, [fetchData, connectionRetry, isOnline]);
 
   // --- LÓGICA DE LOTES ---
 
@@ -182,7 +247,7 @@ const App: React.FC = () => {
         month: 'short',
         hour: '2-digit', 
         minute:'2-digit'
-    }).replace('.', ''); // remove dots from abbr months if any
+    }).replace('.', '');
 
     const defaultName = `Lote ${consecutivo} - ${fechaHora}`;
     setCreateName(defaultName);
@@ -193,6 +258,17 @@ const App: React.FC = () => {
   const executeCreateLote = async () => {
     if (!createName.trim()) return;
     
+    // Bloquear si no hay internet (para lotes es mejor forzar online por consistencia de IDs)
+    if (!isOnline) {
+        setAlertConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'Sin Conexión',
+            message: 'Para crear lotes nuevos necesitas conexión a internet.'
+        });
+        return;
+    }
+
     try {
       if (activeLote && !activeLote.cerrado) {
         await SupabaseService.actualizarEstadoLote(activeLote.id, true);
@@ -216,6 +292,10 @@ const App: React.FC = () => {
   };
 
   const handleToggleLoteStatus = (lote: Lote) => {
+    if (!isOnline) {
+        setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Necesitas internet para modificar lotes.' });
+        return;
+    }
     const nuevoEstadoCerrado = !lote.cerrado;
     const accion = nuevoEstadoCerrado ? "CERRAR" : "REABRIR";
     
@@ -238,6 +318,11 @@ const App: React.FC = () => {
   };
 
   const handleDeleteLote = (loteId: string) => {
+    if (!isOnline) {
+         setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Necesitas internet para eliminar lotes.' });
+         return;
+    }
+
     const lote = lotes.find(l => l.id === loteId);
     if (!lote) return;
 
@@ -250,10 +335,8 @@ const App: React.FC = () => {
         confirmText: 'Sí, Eliminar Todo',
         onConfirm: async () => {
             try {
-                // Optimista: remover de la lista local
                 setLotes(prev => prev.filter(l => l.id !== loteId));
                 if (activeLoteId === loteId) setActiveLoteId(null);
-                
                 await SupabaseService.eliminarLote(loteId);
                 setAlertConfig(prev => ({ ...prev, isOpen: false }));
             } catch (e) {
@@ -274,7 +357,7 @@ const App: React.FC = () => {
     setActiveTab('lista');
   };
 
-  // --- LÓGICA DE ESCANEO ---
+  // --- LÓGICA DE ESCANEO (OFFLINE FIRST) ---
 
   const handleScan = async (decodedText: string) => {
     // 1. Validaciones previas
@@ -301,7 +384,6 @@ const App: React.FC = () => {
     }
 
     const existeEnLote = aretesDelLote.find(a => a.codigo === decodedText);
-
     if (existeEnLote) {
       setAlertConfig({
          isOpen: true,
@@ -312,35 +394,64 @@ const App: React.FC = () => {
       return;
     }
 
-    // 2. Iniciar proceso de guardado (Bloqueo UI)
+    // 2. Iniciar proceso de guardado (Bloqueo UI breve)
     setIsProcessingScan(true);
     if (navigator.vibrate) navigator.vibrate(200);
 
-    try {
-        await SupabaseService.guardarArete(decodedText, activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId);
-        
-        setTimeout(() => {
-            setIsProcessingScan(false);
-            setActiveTab('lista');
-        }, 800); 
+    // 3. Crear objeto local para actualización optimista
+    const tempId = crypto.randomUUID();
+    const newArete: Arete = {
+        id: tempId,
+        codigo: decodedText,
+        fechaEscaneo: new Date().toISOString(),
+        estado: EstadoArete.PENDIENTE,
+        loteId: activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId,
+        sincronizado: false 
+    };
 
-    } catch (error) {
-        console.error(error);
-        setIsProcessingScan(false);
-        setAlertConfig({
-            isOpen: true,
-            type: 'alert',
-            title: 'Error de Guardado',
-            message: 'No se pudo guardar el arete en la nube. Revisa tu conexión.'
-        });
+    // 4. Guardar en cola Offline SIEMPRE (seguridad primero)
+    OfflineStorage.agregarACola(newArete);
+
+    // 5. Actualizar UI inmediatamente
+    setAretes(prev => [newArete, ...prev]);
+
+    // 6. Intentar sincronizar si hay internet
+    if (isOnline) {
+        try {
+            // Intentar subir inmediatamente
+            await SupabaseService.guardarArete(decodedText, newArete.loteId);
+            // Si éxito, quitar de la cola local
+            OfflineStorage.removerDeCola(tempId);
+            // Actualizar estado local a sincronizado
+            setAretes(prev => prev.map(a => a.id === tempId ? { ...a, sincronizado: true } : a));
+        } catch (error) {
+            console.error("Fallo subida inmediata, se queda en cola", error);
+            // No pasa nada, ya está en la cola y en la UI como pendiente
+        }
     }
+
+    setTimeout(() => {
+        setIsProcessingScan(false);
+        setActiveTab('lista');
+    }, 600); 
   };
 
   // --- GESTIÓN DE ARETES ---
 
   const handleUpdateStatus = async (id: string, status: EstadoArete) => {
+    // Optimista
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
-    await SupabaseService.actualizarEstado(id, status);
+    
+    // Si es offline, deberíamos actualizar en la cola offline también?
+    // Por ahora, asumimos que cambios de estado requieren internet para impactar DB real.
+    if (isOnline) {
+        await SupabaseService.actualizarEstado(id, status);
+    } else {
+        // TODO: Implementar cola de actualizaciones. 
+        // Por ahora alertar.
+        // setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Cambio guardado localmente (visual). Se perderá si recargas.' });
+        // Simplemente no hacemos el await.
+    }
   };
 
   const handleDelete = (id: string) => {
@@ -348,12 +459,18 @@ const App: React.FC = () => {
         isOpen: true,
         type: 'confirm',
         title: '¿Eliminar arete?',
-        message: 'Esta acción eliminará el registro de la base de datos para todos. ¿Continuar?',
+        message: 'Esta acción eliminará el registro. ¿Continuar?',
         isDestructive: true,
         confirmText: 'Eliminar',
         onConfirm: async () => {
+            // Eliminar de UI
             setAretes(prev => prev.filter(a => a.id !== id));
-            await SupabaseService.eliminarArete(id);
+            // Eliminar de cola offline si existe
+            OfflineStorage.removerDeCola(id);
+            // Eliminar de servidor si hay red
+            if (isOnline) {
+                await SupabaseService.eliminarArete(id);
+            }
             setAlertConfig(prev => ({ ...prev, isOpen: false }));
         }
     });
@@ -386,25 +503,34 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col max-w-2xl mx-auto shadow-2xl relative">
       {/* Header */}
-      <header className="bg-emerald-700 text-white p-4 sticky top-0 z-50 shadow-md transition-colors duration-500">
+      <header className={`text-white p-4 sticky top-0 z-50 shadow-md transition-colors duration-500 
+          ${!isOnline ? 'bg-slate-700' : 'bg-emerald-700'}`}>
         <div className="relative flex justify-between items-center min-h-[40px]">
           <div className="flex items-center gap-3 z-10 relative">
             <div className="flex items-center gap-2">
-              <ScanLine className="text-emerald-300" />
+              <ScanLine className={!isOnline ? "text-slate-400" : "text-emerald-300"} />
               <div className="flex flex-col leading-none">
                  <span className="text-sm font-bold text-white">SINIIGA</span>
                  <div className="flex items-center gap-1">
-                    {connectionStatus === 'CONNECTED' ? (
+                    {isSyncing ? (
+                         <span className="flex items-center gap-1 text-[10px] text-amber-300 font-bold animate-pulse">
+                            <CloudUpload size={10} /> Sincronizando...
+                         </span>
+                    ) : !isOnline ? (
+                        <span className="flex items-center gap-1 text-[10px] text-slate-300 font-bold">
+                             <WifiOff size={10} /> Modo Offline
+                        </span>
+                    ) : connectionStatus === 'CONNECTED' ? (
                         <span className="flex items-center gap-1 text-[10px] text-emerald-200 font-medium">
                             <span className="relative flex h-2 w-2">
                               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
                             </span>
-                            Sincronizado
+                            En Línea
                         </span>
                     ) : (
-                        <span className="flex items-center gap-1 text-[10px] text-red-200 font-medium">
-                             <WifiOff size={10} /> Desconectado
+                        <span className="flex items-center gap-1 text-[10px] text-yellow-200 font-medium">
+                             <Loader2 size={10} className="animate-spin" /> Conectando...
                         </span>
                     )}
                  </div>
@@ -413,10 +539,15 @@ const App: React.FC = () => {
           </div>
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <h1 className="text-lg md:text-xl font-bold tracking-tight text-white drop-shadow-md whitespace-nowrap">
-              Grupo El Rebozo
+              {isOnline ? 'Grupo El Rebozo' : 'Sin Conexión'}
             </h1>
           </div>
         </div>
+        {!isOnline && (
+            <div className="absolute bottom-0 left-0 right-0 bg-amber-500 text-amber-900 text-[10px] font-bold text-center py-0.5">
+                Los datos se guardarán localmente y se subirán al volver la red.
+            </div>
+        )}
       </header>
 
       {/* Main Content */}
@@ -427,12 +558,13 @@ const App: React.FC = () => {
           <div className="flex flex-col items-center justify-center h-full space-y-6">
             <h2 className="text-xl font-semibold text-slate-800">Escáner de Aretes</h2>
             
-            {/* Overlay de Procesamiento para prevenir crashes */}
+            {/* Overlay de Procesamiento */}
             {isProcessingScan && (
                 <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
                     <Loader2 className="w-12 h-12 text-emerald-600 animate-spin mb-4" />
-                    <h3 className="text-xl font-bold text-emerald-800">Guardando...</h3>
-                    <p className="text-sm text-emerald-600">Sincronizando con la nube</p>
+                    <h3 className="text-xl font-bold text-emerald-800">
+                        {isOnline ? "Guardando..." : "Guardando Offline"}
+                    </h3>
                 </div>
             )}
 

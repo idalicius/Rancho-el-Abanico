@@ -19,6 +19,7 @@ export interface Arete {
   estado: EstadoArete;
   notas?: string;
   loteId?: string; // Nuevo campo para vincular al lote
+  sincronizado?: boolean; // Indica si ya se guardó en la nube
 }
 
 export type Tab = 'lista' | 'escanear' | 'analisis' | 'lotes';

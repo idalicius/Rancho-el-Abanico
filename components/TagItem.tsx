@@ -1,6 +1,6 @@
 import React from 'react';
 import { Arete, EstadoArete } from '../types';
-import { Check, X, AlertTriangle, Trash2, Calendar, Hash } from 'lucide-react';
+import { Check, X, AlertTriangle, Trash2, Calendar, Hash, CloudUpload, CloudCheck } from 'lucide-react';
 
 interface TagItemProps {
   arete: Arete;
@@ -18,18 +18,24 @@ const TagItem: React.FC<TagItemProps> = ({ arete, onUpdateStatus, onDelete }) =>
     }
   };
 
-  const getStatusIcon = (status: EstadoArete) => {
-    switch (status) {
-      case EstadoArete.ALTA_CONFIRMADA: return <Check size={16} />;
-      case EstadoArete.NO_REGISTRADO: return <X size={16} />;
-      case EstadoArete.BAJA: return <AlertTriangle size={16} />;
-      default: return <Hash size={16} />;
-    }
-  };
-
   return (
-    <div className={`p-4 mb-3 rounded-lg border-l-4 shadow-sm transition-all ${getStatusColor(arete.estado)}`}>
-      <div className="flex justify-between items-start gap-4">
+    <div className={`p-4 mb-3 rounded-lg border-l-4 shadow-sm transition-all relative ${getStatusColor(arete.estado)}`}>
+      
+      {/* Indicador de Sincronización */}
+      <div className="absolute top-2 right-2">
+         {arete.sincronizado === false ? (
+             <span className="flex items-center gap-1 text-[10px] font-bold text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-200 animate-pulse">
+                <CloudUpload size={12} /> Pendiente Subir
+             </span>
+         ) : (
+            // Opcional: Mostrar check de nube si está sincronizado, o nada para limpiar la UI
+            <span className="text-slate-300">
+               <CloudCheck size={14} />
+            </span>
+         )}
+      </div>
+
+      <div className="flex justify-between items-start gap-4 mt-2">
         <div className="flex-1 min-w-0">
           <h3 className="text-lg font-bold flex items-center gap-2 truncate">
              <span className="opacity-70 flex-shrink-0">#</span> 
@@ -49,7 +55,7 @@ const TagItem: React.FC<TagItemProps> = ({ arete, onUpdateStatus, onDelete }) =>
             e.stopPropagation();
             onDelete(arete.id);
           }}
-          className="flex-shrink-0 text-slate-400 hover:text-red-500 hover:bg-red-50 p-2 rounded-full transition-colors"
+          className="flex-shrink-0 text-slate-400 hover:text-red-500 hover:bg-red-50 p-2 rounded-full transition-colors mt-1"
           aria-label="Eliminar registro"
           title="Eliminar registro"
         >
