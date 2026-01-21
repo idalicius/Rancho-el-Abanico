@@ -1,20 +1,20 @@
 import React from 'react';
 import { Lote } from '../types';
-import { FolderOpen, FolderClosed, CalendarClock, ArrowRight } from 'lucide-react';
+import { FolderOpen, FolderClosed, CalendarClock, ArrowRight, Trash2 } from 'lucide-react';
 
 interface LotItemProps {
   lote: Lote;
   isActive: boolean;
   totalAretes: number;
   onActivate: (lote: Lote) => void;
-  onClose?: (lote: Lote) => void; // Opcional, si queremos cerrar desde la lista
+  onDelete?: (loteId: string) => void;
 }
 
-const LotItem: React.FC<LotItemProps> = ({ lote, isActive, totalAretes, onActivate }) => {
+const LotItem: React.FC<LotItemProps> = ({ lote, isActive, totalAretes, onActivate, onDelete }) => {
   return (
     <div 
       onClick={() => onActivate(lote)}
-      className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-center justify-between group
+      className={`relative p-4 rounded-xl border-2 transition-all cursor-pointer flex items-center justify-between group
         ${isActive 
           ? 'bg-emerald-50 border-emerald-500 shadow-md' 
           : 'bg-white border-slate-100 hover:border-emerald-200 hover:shadow-sm'
@@ -22,7 +22,7 @@ const LotItem: React.FC<LotItemProps> = ({ lote, isActive, totalAretes, onActiva
         ${lote.cerrado ? 'opacity-80 grayscale-[0.3]' : ''}
       `}
     >
-      <div className="flex items-start gap-3">
+      <div className="flex items-start gap-3 flex-1">
         <div className={`p-2 rounded-lg ${isActive ? 'bg-emerald-200 text-emerald-800' : 'bg-slate-100 text-slate-500'}`}>
           {lote.cerrado ? <FolderClosed size={20} /> : <FolderOpen size={20} />}
         </div>
@@ -44,8 +44,23 @@ const LotItem: React.FC<LotItemProps> = ({ lote, isActive, totalAretes, onActiva
         </div>
       </div>
 
-      <div className={`text-emerald-600 transition-transform ${isActive ? 'translate-x-0' : 'opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0'}`}>
-        <ArrowRight size={20} />
+      <div className="flex items-center gap-2">
+        {onDelete && (
+            <button 
+                onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(lote.id);
+                }}
+                className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-full transition-all"
+                title="Eliminar Lote"
+            >
+                <Trash2 size={18} />
+            </button>
+        )}
+        
+        <div className={`text-emerald-600 transition-transform ${isActive ? 'translate-x-0' : 'opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0'}`}>
+          <ArrowRight size={20} />
+        </div>
       </div>
     </div>
   );

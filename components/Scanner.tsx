@@ -8,14 +8,16 @@ interface ScannerProps {
 const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
   const scannerRef = useRef<any>(null);
   const [error, setError] = useState<string>('');
+  const [permissionGranted, setPermissionGranted] = useState(false);
   
+  // Ref to track if component is mounted to prevent state updates on unmount
   const isMountedRef = useRef(true);
-  // Add a lock ref to prevent multiple scans in the brief moment before unmounting
+  // Ref to prevent double scanning
   const isProcessingRef = useRef(false);
 
   useEffect(() => {
     isMountedRef.current = true;
-    isProcessingRef.current = false; // Reset lock on mount
+    isProcessingRef.current = false;
 
     // @ts-ignore
     if (!window.Html5Qrcode) {
@@ -31,21 +33,21 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
     const config = { 
         fps: 10, 
         qrbox: { width: 250, height: 250 },
-        aspectRatio: 1.0 
+        aspectRatio: 1.0,
+        disableFlip: false 
     };
 
     const startScanner = async () => {
       try {
-        // 1. Get list of cameras to avoid "Requested device not found" errors with generic constraints
         // @ts-ignore
         const devices = await window.Html5Qrcode.getCameras();
         
         if (!devices || devices.length === 0) {
-            throw new Error("No se detectaron cámaras en el dispositivo.");
+            throw new Error("No se detectaron cámaras.");
         }
 
-        // 2. Try to find a back camera
-        let cameraId = devices[0].id; // Default to first available
+        // Prefer back camera
+        let cameraId = devices[0].id;
         const backCamera = devices.find((device: any) => 
             device.label.toLowerCase().includes('back') || 
             device.label.toLowerCase().includes('trasera') ||
@@ -56,79 +58,77 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
             cameraId = backCamera.id;
         }
 
-        // Check mount status before starting
         if (!isMountedRef.current) return;
 
-        // 3. Start scanning with specific device ID
         await html5QrCode.start(
           cameraId, 
           config, 
           (decodedText: string) => {
-              // Critical: check if we already processed a scan
               if (isProcessingRef.current) return;
               isProcessingRef.current = true;
 
-              // Play beep sound
+              // Play sound
               const audio = new Audio('https://codeskulptor-demos.commondatastorage.googleapis.com/pang/pop.mp3');
-              audio.play().catch(e => console.log('Audio error', e));
+              audio.play().catch(() => {});
               
-              // Pause scanner immediately to prevent further frames
+              // Pause scanner visually
               try {
-                if (html5QrCode.isScanning) {
-                    html5QrCode.pause(true);
-                }
-              } catch (e) {
-                // Ignore if pause fails
-              }
+                 html5QrCode.pause(true);
+              } catch (e) {}
 
               onScanSuccess(decodedText);
           },
           (errorMessage: string) => {
-              // parse error, ignore
+              // Ignore parse errors
           }
         );
         
-        if (isMountedRef.current) setError("");
+        if (isMountedRef.current) {
+            setPermissionGranted(true);
+            setError("");
+        }
         
       } catch (err: any) {
-        console.error("Error starting scanner", err);
+        console.error("Error scanner:", err);
         if (isMountedRef.current) {
-            let msg = "No se pudo iniciar la cámara.";
-            if (err?.name === "NotAllowedError") msg = "Permiso de cámara denegado.";
+            let msg = "Error al iniciar cámara.";
+            if (err?.name === "NotAllowedError") msg = "Permiso denegado.";
             if (err?.name === "NotFoundError") msg = "Cámara no encontrada.";
-            // Fallback for getting cameras error
-            if (String(err).includes("No se detectaron")) msg = "No se detectaron cámaras.";
-            
             setError(msg);
         }
       }
     };
 
     if (isScanning) {
-        startScanner();
+        // Small delay to ensure DOM is ready and previous instance is cleared
+        setTimeout(() => {
+            startScanner();
+        }, 300);
     }
 
-    // Cleanup function
+    // Cleanup crucial para evitar pantalla blanca
     return () => {
       isMountedRef.current = false;
       if (scannerRef.current) {
-        // Safe stop logic to prevent "Cannot stop, scanner is not running"
-        // We catch the promise rejection.
-        scannerRef.current.stop()
-            .then(() => {
-                 try { scannerRef.current.clear(); } catch(e) {}
-            })
-            .catch((err: any) => {
-                // This usually happens if stop is called while it's still starting or already stopped
-                // console.log("Scanner cleanup handled:", err);
-                try { scannerRef.current.clear(); } catch(e) {}
-            });
+        // Intentar detener si está corriendo
+        if (scannerRef.current.isScanning) {
+            scannerRef.current.stop()
+                .then(() => {
+                    scannerRef.current.clear();
+                })
+                .catch((err: any) => {
+                    // Si falla el stop, forzamos clear
+                    try { scannerRef.current.clear(); } catch(e) {}
+                });
+        } else {
+             try { scannerRef.current.clear(); } catch(e) {}
+        }
       }
     };
   }, [isScanning, onScanSuccess]);
 
   return (
-    <div className="w-full max-w-md mx-auto bg-black rounded-lg overflow-hidden relative">
+    <div className="w-full max-w-md mx-auto bg-black rounded-lg overflow-hidden relative shadow-2xl">
       <div id="reader" className="w-full h-80 bg-gray-900"></div>
       
       {error && (
@@ -140,17 +140,23 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
         </div>
       )}
 
-      {!error && (
+      {/* Loading state visual */}
+      {!permissionGranted && !error && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-emerald-500"></div>
+        </div>
+      )}
+
+      {permissionGranted && !error && (
         <div className="absolute bottom-4 left-0 right-0 flex justify-center pointer-events-none">
-          <div className="bg-black/60 text-white text-xs px-3 py-1 rounded-full backdrop-blur-sm">
-            Cámara Activa
+          <div className="bg-black/60 text-white text-xs px-3 py-1 rounded-full backdrop-blur-sm animate-pulse">
+            Escaneando...
           </div>
         </div>
       )}
       
-      {/* Overlay guide for user */}
       <div className="absolute inset-0 pointer-events-none border-2 border-white/20 m-8 rounded-lg flex items-center justify-center">
-         <div className="w-64 h-1 bg-red-500/50"></div>
+         <div className="w-64 h-0.5 bg-red-500/50 shadow-[0_0_10px_rgba(239,68,68,0.8)]"></div>
       </div>
     </div>
   );

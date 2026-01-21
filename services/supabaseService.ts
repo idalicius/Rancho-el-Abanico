@@ -52,6 +52,31 @@ export const SupabaseService = {
     if (error) console.error('Error actualizando estado del lote:', error);
   },
 
+  eliminarLote: async (id: string): Promise<void> => {
+    // Primero eliminamos los aretes asociados para asegurar integridad 
+    // (aunque la DB podría tener CASCADE, es mejor ser explícito desde el cliente si no controlamos la DB)
+    const { error: errorAretes } = await supabase
+        .from('aretes')
+        .delete()
+        .eq('lote_id', id);
+    
+    if (errorAretes) {
+        console.error('Error eliminando aretes del lote:', errorAretes);
+        throw new Error("No se pudieron eliminar los aretes del lote.");
+    }
+
+    // Luego eliminamos el lote
+    const { error } = await supabase
+      .from('lotes')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+        console.error('Error eliminando lote:', error);
+        throw error;
+    }
+  },
+
   // --- ARETES ---
 
   // Obtener todos los aretes

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Arete, EstadoArete, Tab, Lote } from './types';
 import { SupabaseService } from './services/supabaseService'; // Cambiado a Supabase
@@ -8,7 +8,7 @@ import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
 import Stats from './components/Stats';
 import LotItem from './components/LotItem';
-import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText } from 'lucide-react';
+import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText, Wifi, WifiOff, Loader2 } from 'lucide-react';
 
 const UNASSIGNED_LOTE_ID = 'unassigned';
 
@@ -20,6 +20,10 @@ const App: React.FC = () => {
   
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoadingData, setIsLoadingData] = useState(true);
+  const [isProcessingScan, setIsProcessingScan] = useState(false); // Nuevo estado para prevenir crash
+  
+  // Estado de conexión Realtime
+  const [connectionStatus, setConnectionStatus] = useState<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED'>('CONNECTING');
 
   // --- ESTADOS PARA MODALES ---
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -35,55 +39,50 @@ const App: React.FC = () => {
     confirmText?: string;
   }>({ isOpen: false, type: 'alert', title: '', message: '' });
 
-  // 1. CARGA INICIAL DE DATOS DESDE SUPABASE
+  // Función para cargar datos (reutilizable)
+  const fetchData = useCallback(async (isInitialLoad = false) => {
+    if (isInitialLoad) setIsLoadingData(true);
+    try {
+      const [aretesData, lotesData] = await Promise.all([
+        SupabaseService.obtenerAretes(),
+        SupabaseService.obtenerLotes()
+      ]);
+      
+      setAretes(aretesData);
+      setLotes(lotesData);
+      
+      return { aretesData, lotesData };
+    } catch (e) {
+      console.error("Error fetching data", e);
+      return null;
+    } finally {
+      if (isInitialLoad) setIsLoadingData(false);
+    }
+  }, []);
+
+  // 1. CARGA INICIAL Y REALTIME
   useEffect(() => {
-    const loadData = async () => {
-      setIsLoadingData(true);
-      try {
-        const [aretesData, lotesData] = await Promise.all([
-          SupabaseService.obtenerAretes(),
-          SupabaseService.obtenerLotes()
-        ]);
-        
-        setAretes(aretesData);
-        setLotes(lotesData);
-        
-        // Auto-selección inteligente
-        if (!activeLoteId) {
-          const ultimoAbierto = lotesData.find(l => !l.cerrado);
-          
-          if (ultimoAbierto) {
-            setActiveLoteId(ultimoAbierto.id);
-          } else {
-            const hayAretesSinLote = aretesData.some(a => !a.loteId);
-            if (hayAretesSinLote) {
-              setActiveLoteId(UNASSIGNED_LOTE_ID);
+    // Carga inicial
+    fetchData(true).then((data) => {
+        if (data && !activeLoteId) {
+            const ultimoAbierto = data.lotesData.find(l => !l.cerrado);
+            if (ultimoAbierto) {
+                setActiveLoteId(ultimoAbierto.id);
+            } else {
+                const hayAretesSinLote = data.aretesData.some(a => !a.loteId);
+                if (hayAretesSinLote) {
+                    setActiveLoteId(UNASSIGNED_LOTE_ID);
+                }
             }
-          }
         }
-      } catch (e) {
-        console.error("Error cargando datos de la nube", e);
-        setAlertConfig({
-            isOpen: true,
-            type: 'alert',
-            title: 'Error de Conexión',
-            message: 'No se pudieron cargar los datos de la nube. Revisa tu internet.'
-        });
-      } finally {
-        setIsLoadingData(false);
-      }
-    };
+    });
 
-    loadData();
-
-    // 2. CONFIGURACIÓN DE REALTIME (SINCRONIZACIÓN)
-    // Escuchamos cambios en la base de datos para actualizar la UI al instante
-    const channel = supabase.channel('cambios-globales')
+    // Configuración de Realtime ROBUSTA
+    const channel = supabase.channel('global-changes')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'aretes' },
         (payload) => {
-          // Manejar cambios en ARETES
           if (payload.eventType === 'INSERT') {
             const newRow = payload.new;
             const newArete: Arete = {
@@ -94,8 +93,14 @@ const App: React.FC = () => {
               loteId: newRow.lote_id,
               notas: newRow.notas
             };
-            setAretes(prev => [newArete, ...prev]);
-            if (navigator.vibrate) navigator.vibrate(50); // Pequeña vibración al recibir datos remotos
+            setAretes(prev => {
+                if (prev.some(a => a.id === newArete.id)) return prev;
+                return [newArete, ...prev];
+            });
+            // Vibrar solo si NO soy yo quien está escaneando (para evitar doble vibración)
+            if (!document.hidden) {
+                if (navigator.vibrate) navigator.vibrate(50);
+            }
           } else if (payload.eventType === 'UPDATE') {
              const updatedRow = payload.new;
              setAretes(prev => prev.map(a => a.id === updatedRow.id ? {
@@ -113,7 +118,6 @@ const App: React.FC = () => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'lotes' },
         (payload) => {
-          // Manejar cambios en LOTES (Cierre/Apertura/Creación)
           if (payload.eventType === 'INSERT') {
              const newRow = payload.new;
              const newLote: Lote = {
@@ -130,16 +134,32 @@ const App: React.FC = () => {
                 cerrado: updatedRow.cerrado,
                 nombre: updatedRow.nombre
              } : l));
+          } else if (payload.eventType === 'DELETE') {
+             setLotes(prev => prev.filter(l => l.id !== payload.old.id));
+             // Si el lote borrado era el activo, desasignar
+             setActiveLoteId(prevId => prevId === payload.old.id ? null : prevId);
           }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+            setConnectionStatus('CONNECTED');
+            fetchData(false); 
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+            setConnectionStatus('DISCONNECTED');
+            setTimeout(() => {
+                channel.subscribe();
+            }, 5000);
+        } else {
+            setConnectionStatus('CONNECTING');
+        }
+      });
 
     return () => {
       supabase.removeChannel(channel);
     };
 
-  }, []); // Se ejecuta solo al montar
+  }, [fetchData]);
 
   // --- LÓGICA DE LOTES ---
 
@@ -154,9 +174,17 @@ const App: React.FC = () => {
     return aretes.filter(a => a.loteId === activeLoteId);
   }, [aretes, activeLoteId, isUnassignedView]);
 
-  // Handler para ABRIR el modal de creación
+  // Handler para ABRIR el modal de creación CON CONSECUTIVO AUTOMÁTICO
   const handleCreateLote = () => {
-    const defaultName = `Lote ${new Date().toLocaleDateString('es-MX')} ${new Date().toLocaleTimeString('es-MX', {hour: '2-digit', minute:'2-digit'})}`;
+    const consecutivo = lotes.length + 1;
+    const fechaHora = new Date().toLocaleString('es-MX', {
+        day: '2-digit', 
+        month: 'short',
+        hour: '2-digit', 
+        minute:'2-digit'
+    }).replace('.', ''); // remove dots from abbr months if any
+
+    const defaultName = `Lote ${consecutivo} - ${fechaHora}`;
     setCreateName(defaultName);
     setShowCreateModal(true);
   };
@@ -166,16 +194,12 @@ const App: React.FC = () => {
     if (!createName.trim()) return;
     
     try {
-      // Cerrar lote anterior si existe
       if (activeLote && !activeLote.cerrado) {
         await SupabaseService.actualizarEstadoLote(activeLote.id, true);
-        // La actualización de estado local se maneja vía Realtime, pero podemos hacerlo optimista
       }
 
       const nuevoLote = await SupabaseService.crearLote(createName);
       if (nuevoLote) {
-        // No necesitamos setLotes manual si el Realtime funciona rápido, 
-        // pero para la selección del ID activo, lo hacemos aquí:
         setActiveLoteId(nuevoLote.id);
         setActiveTab('lista');
       }
@@ -204,13 +228,43 @@ const App: React.FC = () => {
         isDestructive: accion === "CERRAR",
         onConfirm: async () => {
            await SupabaseService.actualizarEstadoLote(lote.id, nuevoEstadoCerrado);
-           // La UI se actualiza vía suscripción Realtime
-           
            if (!nuevoEstadoCerrado) {
              setActiveLoteId(lote.id);
              setActiveTab('lista');
            }
            setAlertConfig(prev => ({ ...prev, isOpen: false }));
+        }
+    });
+  };
+
+  const handleDeleteLote = (loteId: string) => {
+    const lote = lotes.find(l => l.id === loteId);
+    if (!lote) return;
+
+    setAlertConfig({
+        isOpen: true,
+        type: 'confirm',
+        title: 'Eliminar Lote Completo',
+        message: `Estás a punto de eliminar el "${lote.nombre}" y TODOS los aretes que contiene. Esta acción no se puede deshacer.`,
+        isDestructive: true,
+        confirmText: 'Sí, Eliminar Todo',
+        onConfirm: async () => {
+            try {
+                // Optimista: remover de la lista local
+                setLotes(prev => prev.filter(l => l.id !== loteId));
+                if (activeLoteId === loteId) setActiveLoteId(null);
+                
+                await SupabaseService.eliminarLote(loteId);
+                setAlertConfig(prev => ({ ...prev, isOpen: false }));
+            } catch (e) {
+                console.error(e);
+                setAlertConfig({
+                    isOpen: true,
+                    type: 'alert',
+                    title: 'Error',
+                    message: 'Hubo un problema al eliminar el lote. Intenta de nuevo.'
+                });
+            }
         }
     });
   };
@@ -223,6 +277,7 @@ const App: React.FC = () => {
   // --- LÓGICA DE ESCANEO ---
 
   const handleScan = async (decodedText: string) => {
+    // 1. Validaciones previas
     if (!activeLoteId) {
       setAlertConfig({
         isOpen: true,
@@ -254,22 +309,36 @@ const App: React.FC = () => {
          title: '⚠️ Duplicado',
          message: `El arete ${decodedText} ya está en esta lista.`
       });
-      setActiveTab('lista');
       return;
     }
 
-    // Guardar en Supabase. El arete aparecerá en la lista gracias a la suscripción Realtime.
-    await SupabaseService.guardarArete(decodedText, activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId);
-    
-    // Feedback inmediato
+    // 2. Iniciar proceso de guardado (Bloqueo UI)
+    setIsProcessingScan(true);
     if (navigator.vibrate) navigator.vibrate(200);
-    setActiveTab('lista');
+
+    try {
+        await SupabaseService.guardarArete(decodedText, activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId);
+        
+        setTimeout(() => {
+            setIsProcessingScan(false);
+            setActiveTab('lista');
+        }, 800); 
+
+    } catch (error) {
+        console.error(error);
+        setIsProcessingScan(false);
+        setAlertConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'Error de Guardado',
+            message: 'No se pudo guardar el arete en la nube. Revisa tu conexión.'
+        });
+    }
   };
 
   // --- GESTIÓN DE ARETES ---
 
   const handleUpdateStatus = async (id: string, status: EstadoArete) => {
-    // Actualización optimista para UX
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
     await SupabaseService.actualizarEstado(id, status);
   };
@@ -283,7 +352,6 @@ const App: React.FC = () => {
         isDestructive: true,
         confirmText: 'Eliminar',
         onConfirm: async () => {
-            // Actualización optimista
             setAretes(prev => prev.filter(a => a.id !== id));
             await SupabaseService.eliminarArete(id);
             setAlertConfig(prev => ({ ...prev, isOpen: false }));
@@ -325,7 +393,21 @@ const App: React.FC = () => {
               <ScanLine className="text-emerald-300" />
               <div className="flex flex-col leading-none">
                  <span className="text-sm font-bold text-white">SINIIGA</span>
-                 <span className="text-[10px] text-emerald-200">Cloud Sync</span>
+                 <div className="flex items-center gap-1">
+                    {connectionStatus === 'CONNECTED' ? (
+                        <span className="flex items-center gap-1 text-[10px] text-emerald-200 font-medium">
+                            <span className="relative flex h-2 w-2">
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
+                            </span>
+                            Sincronizado
+                        </span>
+                    ) : (
+                        <span className="flex items-center gap-1 text-[10px] text-red-200 font-medium">
+                             <WifiOff size={10} /> Desconectado
+                        </span>
+                    )}
+                 </div>
               </div>
             </div>
           </div>
@@ -344,6 +426,16 @@ const App: React.FC = () => {
         {activeTab === 'escanear' && (
           <div className="flex flex-col items-center justify-center h-full space-y-6">
             <h2 className="text-xl font-semibold text-slate-800">Escáner de Aretes</h2>
+            
+            {/* Overlay de Procesamiento para prevenir crashes */}
+            {isProcessingScan && (
+                <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
+                    <Loader2 className="w-12 h-12 text-emerald-600 animate-spin mb-4" />
+                    <h3 className="text-xl font-bold text-emerald-800">Guardando...</h3>
+                    <p className="text-sm text-emerald-600">Sincronizando con la nube</p>
+                </div>
+            )}
+
             {!activeLoteId ? (
                 <div className="bg-yellow-50 border border-yellow-200 p-6 rounded-xl text-center max-w-xs">
                     <AlertTriangle size={48} className="mx-auto text-yellow-500 mb-3" />
@@ -370,7 +462,8 @@ const App: React.FC = () => {
                                 Guardando en: {isUnassignedView ? 'Sin Lote Asignado' : activeLote?.nombre}
                             </span>
                         </div>
-                        <Scanner onScanSuccess={handleScan} isScanning={activeTab === 'escanear'} />
+                        {/* Pasamos el estado al scanner para que sepa cuándo detenerse */}
+                        <Scanner onScanSuccess={handleScan} isScanning={activeTab === 'escanear' && !isProcessingScan} />
                     </div>
                     <p className="text-sm text-slate-500 text-center max-w-xs">
                         Apunta la cámara al código de barras.
@@ -421,28 +514,28 @@ const App: React.FC = () => {
                                     <div className="flex justify-between items-start mb-4">
                                         <div>
                                             <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
-                                                {isUnassignedView ? "Aretes Sin Lote" : activeLote?.nombre}
+                                                {isUnassignedView ? "Aretes Sin Lote" : (activeLote?.nombre || 'Lote No Encontrado')}
                                                 {!isUnassignedView && activeLote?.cerrado && <Lock size={16} className="text-red-500" />}
                                             </h2>
                                             <p className="text-xs text-slate-500">
                                                 {isUnassignedView 
                                                     ? "Registros antiguos o sin asignar" 
-                                                    : `Creado: ${new Date(activeLote!.fechaCreacion).toLocaleString('es-MX')}`
+                                                    : (activeLote ? `Creado: ${new Date(activeLote.fechaCreacion).toLocaleString('es-MX')}` : 'Seleccione otro lote')
                                                 }
                                             </p>
                                         </div>
                                         
-                                        {!isUnassignedView && (
+                                        {!isUnassignedView && activeLote && (
                                             <button 
-                                                onClick={() => handleToggleLoteStatus(activeLote!)}
+                                                onClick={() => handleToggleLoteStatus(activeLote)}
                                                 className={`px-3 py-1.5 rounded-lg text-xs font-bold border flex items-center gap-1 transition-colors
-                                                    ${activeLote?.cerrado 
+                                                    ${activeLote.cerrado 
                                                         ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' 
                                                         : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'
                                                     }`}
                                             >
-                                                {activeLote?.cerrado ? <Unlock size={14} /> : <Lock size={14} />}
-                                                {activeLote?.cerrado ? "REABRIR" : "CERRAR"}
+                                                {activeLote.cerrado ? <Unlock size={14} /> : <Lock size={14} />}
+                                                {activeLote.cerrado ? "REABRIR" : "CERRAR"}
                                             </button>
                                         )}
                                     </div>
@@ -546,6 +639,7 @@ const App: React.FC = () => {
                                         isActive={activeLoteId === lote.id}
                                         totalAretes={aretes.filter(a => a.loteId === lote.id).length}
                                         onActivate={() => handleActivateLote(lote.id)}
+                                        onDelete={handleDeleteLote}
                                     />
                                 ))}
                             </div>
