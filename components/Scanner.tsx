@@ -16,13 +16,6 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
   useEffect(() => {
     isMountedRef.current = true;
     isProcessingRef.current = false; // Reset lock on mount
-    return () => {
-      isMountedRef.current = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isScanning) return;
 
     // @ts-ignore
     if (!window.Html5Qrcode) {
@@ -41,11 +34,34 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
         aspectRatio: 1.0 
     };
 
-    // Explicitly request environment (back) camera
     const startScanner = async () => {
       try {
+        // 1. Get list of cameras to avoid "Requested device not found" errors with generic constraints
+        // @ts-ignore
+        const devices = await window.Html5Qrcode.getCameras();
+        
+        if (!devices || devices.length === 0) {
+            throw new Error("No se detectaron cámaras en el dispositivo.");
+        }
+
+        // 2. Try to find a back camera
+        let cameraId = devices[0].id; // Default to first available
+        const backCamera = devices.find((device: any) => 
+            device.label.toLowerCase().includes('back') || 
+            device.label.toLowerCase().includes('trasera') ||
+            device.label.toLowerCase().includes('environment')
+        );
+        
+        if (backCamera) {
+            cameraId = backCamera.id;
+        }
+
+        // Check mount status before starting
+        if (!isMountedRef.current) return;
+
+        // 3. Start scanning with specific device ID
         await html5QrCode.start(
-          { facingMode: "environment" }, 
+          cameraId, 
           config, 
           (decodedText: string) => {
               // Critical: check if we already processed a scan
@@ -58,7 +74,9 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
               
               // Pause scanner immediately to prevent further frames
               try {
-                html5QrCode.pause();
+                if (html5QrCode.isScanning) {
+                    html5QrCode.pause(true);
+                }
               } catch (e) {
                 // Ignore if pause fails
               }
@@ -69,26 +87,42 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
               // parse error, ignore
           }
         );
+        
         if (isMountedRef.current) setError("");
-      } catch (err) {
+        
+      } catch (err: any) {
         console.error("Error starting scanner", err);
         if (isMountedRef.current) {
-            setError("No se pudo iniciar la cámara trasera. Asegúrate de dar permisos de cámara y estar usando HTTPS.");
+            let msg = "No se pudo iniciar la cámara.";
+            if (err?.name === "NotAllowedError") msg = "Permiso de cámara denegado.";
+            if (err?.name === "NotFoundError") msg = "Cámara no encontrada.";
+            // Fallback for getting cameras error
+            if (String(err).includes("No se detectaron")) msg = "No se detectaron cámaras.";
+            
+            setError(msg);
         }
       }
     };
 
-    startScanner();
+    if (isScanning) {
+        startScanner();
+    }
 
     // Cleanup function
     return () => {
-      if (html5QrCode) {
-        // We use a try-catch for stop because sometimes it might not be running fully yet
-        html5QrCode.stop().catch((e: any) => {
-            console.log("Scanner stop info:", e); 
-        }).finally(() => {
-            html5QrCode.clear();
-        });
+      isMountedRef.current = false;
+      if (scannerRef.current) {
+        // Safe stop logic to prevent "Cannot stop, scanner is not running"
+        // We catch the promise rejection.
+        scannerRef.current.stop()
+            .then(() => {
+                 try { scannerRef.current.clear(); } catch(e) {}
+            })
+            .catch((err: any) => {
+                // This usually happens if stop is called while it's still starting or already stopped
+                // console.log("Scanner cleanup handled:", err);
+                try { scannerRef.current.clear(); } catch(e) {}
+            });
       }
     };
   }, [isScanning, onScanSuccess]);
@@ -109,7 +143,7 @@ const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
       {!error && (
         <div className="absolute bottom-4 left-0 right-0 flex justify-center pointer-events-none">
           <div className="bg-black/60 text-white text-xs px-3 py-1 rounded-full backdrop-blur-sm">
-            Cámara Trasera Activa
+            Cámara Activa
           </div>
         </div>
       )}

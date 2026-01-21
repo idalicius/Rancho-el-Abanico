@@ -1,8 +1,60 @@
 import { supabase } from './supabaseClient';
-import { Arete, EstadoArete } from '../types';
+import { Arete, EstadoArete, Lote } from '../types';
 
 export const SupabaseService = {
-  // Obtener todos los aretes (carga inicial)
+  // --- LOTES ---
+
+  obtenerLotes: async (): Promise<Lote[]> => {
+    const { data, error } = await supabase
+      .from('lotes')
+      .select('*')
+      .order('fecha_creacion', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching lotes:', error);
+      return [];
+    }
+
+    return data.map((item: any) => ({
+      id: item.id,
+      nombre: item.nombre,
+      fechaCreacion: item.fecha_creacion,
+      cerrado: item.cerrado
+    }));
+  },
+
+  crearLote: async (nombre: string): Promise<Lote | null> => {
+    const { data, error } = await supabase
+      .from('lotes')
+      .insert([{ nombre, cerrado: false }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creando lote:', error);
+      return null;
+    }
+
+    return {
+      id: data.id,
+      nombre: data.nombre,
+      fechaCreacion: data.fecha_creacion,
+      cerrado: data.cerrado
+    };
+  },
+
+  actualizarEstadoLote: async (id: string, cerrado: boolean): Promise<void> => {
+    const { error } = await supabase
+      .from('lotes')
+      .update({ cerrado })
+      .eq('id', id);
+
+    if (error) console.error('Error actualizando estado del lote:', error);
+  },
+
+  // --- ARETES ---
+
+  // Obtener todos los aretes
   obtenerAretes: async (): Promise<Arete[]> => {
     const { data, error } = await supabase
       .from('aretes')
@@ -14,25 +66,26 @@ export const SupabaseService = {
       return [];
     }
 
-    // Mapear de snake_case (DB) a camelCase (Frontend)
     return data.map((item: any) => ({
       id: item.id,
       codigo: item.codigo,
       fechaEscaneo: item.fecha_escaneo,
       estado: item.estado as EstadoArete,
-      notas: item.notas
+      notas: item.notas,
+      loteId: item.lote_id
     }));
   },
 
-  // Guardar un nuevo arete
-  guardarArete: async (codigo: string): Promise<void> => {
+  // Guardar un nuevo arete vinculado a un lote
+  guardarArete: async (codigo: string, loteId?: string): Promise<void> => {
     const { error } = await supabase
       .from('aretes')
       .insert([
         { 
           codigo, 
           estado: EstadoArete.PENDIENTE,
-          fecha_escaneo: new Date().toISOString()
+          fecha_escaneo: new Date().toISOString(),
+          lote_id: loteId || null
         }
       ]);
 
@@ -61,14 +114,8 @@ export const SupabaseService = {
 
   // Eliminar todo (peligroso, para el botón de limpiar)
   limpiarTodo: async (): Promise<void> => {
-     // Nota: En un entorno real, esto debería estar protegido o no existir.
-     // Supabase no permite delete sin where por defecto a menos que se configure,
-     // así que iteramos o usamos una condición amplia.
-     const { error } = await supabase
-       .from('aretes')
-       .delete()
-       .neq('id', '00000000-0000-0000-0000-000000000000'); // Borrar todo lo que tenga ID válido
-     
-     if (error) console.error('Error limpiando BD:', error);
+     // Borra aretes primero por FK
+     await supabase.from('aretes').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+     // Podría borrar lotes, pero por seguridad mejor dejarlos o borrarlos aparte
   }
 };

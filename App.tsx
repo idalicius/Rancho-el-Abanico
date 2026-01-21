@@ -1,227 +1,498 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Arete, EstadoArete, Tab } from './types';
-import { SupabaseService } from './services/supabaseService';
-import { supabase } from './services/supabaseClient';
+import { Arete, EstadoArete, Tab, Lote } from './types';
+import { StorageService } from './services/storageService'; 
 import Scanner from './components/Scanner';
 import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
 import Stats from './components/Stats';
-import { ScanLine, List, CalendarRange, Search, Trash, Wifi, RefreshCw, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+import LotItem from './components/LotItem';
+import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText } from 'lucide-react';
+
+const UNASSIGNED_LOTE_ID = 'unassigned';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('lista');
   const [aretes, setAretes] = useState<Arete[]>([]);
+  const [lotes, setLotes] = useState<Lote[]>([]);
+  const [activeLoteId, setActiveLoteId] = useState<string | null>(null);
+  
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoadingData, setIsLoadingData] = useState(true);
-  const [isConnected, setIsConnected] = useState(false);
 
-  // Load initial data and Setup Realtime Subscription
+  // --- ESTADOS PARA MODALES ---
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [createName, setCreateName] = useState('');
+
+  const [alertConfig, setAlertConfig] = useState<{
+    isOpen: boolean;
+    type: 'alert' | 'confirm';
+    title: string;
+    message: string;
+    onConfirm?: () => void;
+    isDestructive?: boolean;
+    confirmText?: string;
+  }>({ isOpen: false, type: 'alert', title: '', message: '' });
+
+  // Load initial data
   useEffect(() => {
-    const loadData = async (silent = false) => {
-      if (!silent) setIsLoadingData(true);
-      const data = await SupabaseService.obtenerAretes();
-      setAretes(data);
-      if (!silent) setIsLoadingData(false);
+    const loadData = async () => {
+      setIsLoadingData(true);
+      try {
+        const [aretesData, lotesData] = await Promise.all([
+          StorageService.obtenerAretes(),
+          StorageService.obtenerLotes()
+        ]);
+        
+        setAretes(aretesData);
+        setLotes(lotesData);
+        
+        // Auto-selection logic
+        if (!activeLoteId) {
+          const ultimoAbierto = lotesData.find(l => !l.cerrado);
+          
+          if (ultimoAbierto) {
+            setActiveLoteId(ultimoAbierto.id);
+          } else {
+            const hayAretesSinLote = aretesData.some(a => !a.loteId);
+            if (hayAretesSinLote) {
+              setActiveLoteId(UNASSIGNED_LOTE_ID);
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Error cargando datos", e);
+        setAlertConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'Error',
+            message: 'Hubo un problema cargando los datos locales.'
+        });
+      } finally {
+        setIsLoadingData(false);
+      }
     };
 
     loadData();
-
-    const channel = supabase
-      .channel('cambios_aretes')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'aretes' },
-        (payload) => {
-          console.log('Cambio detectado en tiempo real:', payload);
-          loadData(true);
-          
-          if (document.hidden || activeTab === 'lista') {
-             // Sonido opcional
-          }
-        }
-      )
-      .subscribe((status) => {
-        setIsConnected(status === 'SUBSCRIBED');
-      });
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
   }, []);
 
-  const handleScan = async (decodedText: string) => {
-    // 1. VALIDACIÓN DE DUPLICADOS
-    const existe = aretes.find(a => a.codigo === decodedText);
+  // --- LÓGICA DE LOTES ---
 
-    if (existe) {
-      // Alerta al usuario
-      alert(`⚠️ DUPLICADO DETECTADO\n\nEl arete ${decodedText} ya fue escaneado el ${new Date(existe.fechaEscaneo).toLocaleDateString('es-MX')}.`);
-      
-      // Cerrar escáner inmediatamente
-      setActiveTab('lista');
-      return; // Detener ejecución, no guardar
+  const activeLote = lotes.find(l => l.id === activeLoteId);
+  const isUnassignedView = activeLoteId === UNASSIGNED_LOTE_ID;
+
+  const aretesDelLote = useMemo(() => {
+    if (isUnassignedView) {
+        return aretes.filter(a => !a.loteId);
     }
+    if (!activeLoteId) return [];
+    return aretes.filter(a => a.loteId === activeLoteId);
+  }, [aretes, activeLoteId, isUnassignedView]);
 
-    // 2. Guardar en Supabase (si no es duplicado)
-    await SupabaseService.guardarArete(decodedText);
+  // Handler para ABRIR el modal de creación
+  const handleCreateLote = () => {
+    const defaultName = `Lote ${new Date().toLocaleDateString('es-MX')} ${new Date().toLocaleTimeString('es-MX', {hour: '2-digit', minute:'2-digit'})}`;
+    setCreateName(defaultName);
+    setShowCreateModal(true);
+  };
+
+  // Handler para EJECUTAR la creación (desde el modal)
+  const executeCreateLote = async () => {
+    if (!createName.trim()) return;
     
-    // 3. Cerrar el escáner
-    setActiveTab('lista');
-    
-    if (navigator.vibrate) {
-      navigator.vibrate(200);
+    try {
+      // Cerrar lote anterior si existe
+      if (activeLote && !activeLote.cerrado) {
+        await StorageService.actualizarEstadoLote(activeLote.id, true);
+        setLotes(prev => prev.map(l => l.id === activeLote.id ? { ...l, cerrado: true } : l));
+      }
+
+      const nuevoLote = await StorageService.crearLote(createName);
+      setLotes(prev => [nuevoLote, ...prev]);
+      setActiveLoteId(nuevoLote.id);
+      setActiveTab('lista');
+      setShowCreateModal(false);
+    } catch (e) {
+      console.error(e);
+      setAlertConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Error',
+        message: 'No se pudo crear el lote. Intenta de nuevo.'
+      });
     }
   };
+
+  const handleToggleLoteStatus = (lote: Lote) => {
+    const nuevoEstadoCerrado = !lote.cerrado;
+    const accion = nuevoEstadoCerrado ? "CERRAR" : "REABRIR";
+    
+    setAlertConfig({
+        isOpen: true,
+        type: 'confirm',
+        title: `${accion} Lote`,
+        message: `¿Estás seguro de ${accion.toLowerCase()} el lote "${lote.nombre}"?`,
+        confirmText: accion === "CERRAR" ? "Sí, Cerrar" : "Sí, Reabrir",
+        isDestructive: accion === "CERRAR",
+        onConfirm: async () => {
+           await StorageService.actualizarEstadoLote(lote.id, nuevoEstadoCerrado);
+           setLotes(prev => prev.map(l => l.id === lote.id ? { ...l, cerrado: nuevoEstadoCerrado } : l));
+           
+           if (!nuevoEstadoCerrado) {
+             setActiveLoteId(lote.id);
+             setActiveTab('lista');
+           }
+           setAlertConfig(prev => ({ ...prev, isOpen: false }));
+        }
+    });
+  };
+
+  const handleActivateLote = (loteId: string) => {
+    setActiveLoteId(loteId);
+    setActiveTab('lista');
+  };
+
+  // --- LÓGICA DE ESCANEO ---
+
+  const handleScan = async (decodedText: string) => {
+    if (!activeLoteId) {
+      setAlertConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Sin Lote Activo',
+        message: 'Debes crear o seleccionar un lote antes de escanear.'
+      });
+      setActiveTab('lotes');
+      return;
+    }
+
+    if (!isUnassignedView && activeLote?.cerrado) {
+       setAlertConfig({
+         isOpen: true,
+         type: 'alert',
+         title: 'Lote Cerrado',
+         message: `El lote "${activeLote.nombre}" está cerrado. Reábrelo para continuar.`
+       });
+       setActiveTab('lotes');
+       return;
+    }
+
+    const existeEnLote = aretesDelLote.find(a => a.codigo === decodedText);
+
+    if (existeEnLote) {
+      setAlertConfig({
+         isOpen: true,
+         type: 'alert',
+         title: '⚠️ Duplicado',
+         message: `El arete ${decodedText} ya está en esta lista.`
+      });
+      setActiveTab('lista');
+      return;
+    }
+
+    await StorageService.guardarArete(decodedText, activeLoteId);
+    
+    const nuevoArete: Arete = {
+        id: crypto.randomUUID(), 
+        codigo: decodedText,
+        fechaEscaneo: new Date().toISOString(),
+        estado: EstadoArete.PENDIENTE,
+        loteId: activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId
+    };
+    setAretes(prev => [nuevoArete, ...prev]);
+    setActiveTab('lista');
+    
+    if (navigator.vibrate) navigator.vibrate(200);
+  };
+
+  // --- GESTIÓN DE ARETES ---
 
   const handleUpdateStatus = async (id: string, status: EstadoArete) => {
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
-    await SupabaseService.actualizarEstado(id, status);
+    await StorageService.actualizarEstado(id, status);
   };
 
-  const handleDelete = async (id: string) => {
-    if(confirm('¿Estás seguro de eliminar este registro de la base de datos?')) {
-      setAretes(prev => prev.filter(a => a.id !== id));
-      await SupabaseService.eliminarArete(id);
-    }
+  const handleDelete = (id: string) => {
+    setAlertConfig({
+        isOpen: true,
+        type: 'confirm',
+        title: '¿Eliminar arete?',
+        message: 'Esta acción eliminará el registro de la lista. ¿Continuar?',
+        isDestructive: true,
+        confirmText: 'Eliminar',
+        onConfirm: async () => {
+            setAretes(prev => prev.filter(a => a.id !== id));
+            await StorageService.eliminarArete(id);
+            setAlertConfig(prev => ({ ...prev, isOpen: false }));
+        }
+    });
   };
 
-  const handleClearAll = async () => {
-    if(confirm('PELIGRO: Esto borrará TODOS los aretes de la base de datos para TODOS los usuarios. ¿Continuar?')) {
-      setAretes([]);
-      await SupabaseService.limpiarTodo();
-    }
-  };
-
-  const filteredAretes = aretes.filter(a => 
+  const filteredAretes = aretesDelLote.filter(a => 
     a.codigo.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  // Agrupación para el reporte por fechas
+  const aretesSinLoteCount = aretes.filter(a => !a.loteId).length;
+
+  // --- REPORTE ---
   const reportePorFecha = useMemo(() => {
     const grupos: Record<string, Arete[]> = {};
-    
     aretes.forEach(arete => {
       const fecha = new Date(arete.fechaEscaneo).toLocaleDateString('es-MX', { 
-        year: 'numeric', 
-        month: 'long', 
-        day: 'numeric' 
+        year: 'numeric', month: 'long', day: 'numeric' 
       });
       if (!grupos[fecha]) grupos[fecha] = [];
       grupos[fecha].push(arete);
     });
-
     return Object.entries(grupos).sort((a, b) => {
-      // Ordenar por fecha descendente (asumiendo que los aretes ya vienen ordenados o usando el primer elemento)
-      return new Date(b[1][0].fechaEscaneo).getTime() - new Date(a[1][0].fechaEscaneo).getTime();
+      if (b[1].length > 0 && a[1].length > 0) {
+        return new Date(b[1][0].fechaEscaneo).getTime() - new Date(a[1][0].fechaEscaneo).getTime();
+      }
+      return 0;
     });
   }, [aretes]);
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col max-w-2xl mx-auto shadow-2xl">
+    <div className="min-h-screen bg-slate-50 flex flex-col max-w-2xl mx-auto shadow-2xl relative">
       {/* Header */}
       <header className="bg-emerald-700 text-white p-4 sticky top-0 z-50 shadow-md transition-colors duration-500">
-        <div className="flex justify-between items-center">
-          <div className="flex items-center gap-2">
-            <ScanLine className="text-emerald-300" />
-            <div>
-              <h1 className="text-xl font-bold tracking-tight">GanadoScan <span className="text-xs font-normal opacity-75 block -mt-1">SINIIGA Cloud</span></h1>
+        <div className="relative flex justify-between items-center min-h-[40px]">
+          <div className="flex items-center gap-3 z-10 relative">
+            <div className="flex items-center gap-2">
+              <ScanLine className="text-emerald-300" />
+              <div className="flex flex-col leading-none">
+                 <span className="text-sm font-bold text-white">SINIIGA</span>
+                 <span className="text-[10px] text-emerald-200">Cloud</span>
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <div 
-                className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ${isConnected ? 'bg-emerald-800 text-emerald-100' : 'bg-red-800 text-red-100'}`} 
-                title={isConnected ? "Conectado a Tiempo Real" : "Desconectado"}
-            >
-                <Wifi size={12} className={isConnected ? "" : "opacity-50"} />
-                <span className="hidden sm:inline">{isConnected ? 'LIVE' : 'OFF'}</span>
-            </div>
-            {activeTab === 'lista' && (
-              <ExportButton aretes={aretes} />
-            )}
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <h1 className="text-lg md:text-xl font-bold tracking-tight text-white drop-shadow-md whitespace-nowrap">
+              Grupo El Rebozo
+            </h1>
           </div>
         </div>
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 p-4 pb-24 overflow-y-auto">
+      <main className="flex-1 p-4 pb-28 overflow-y-auto bg-slate-50">
         
         {/* VIEW: SCANNER */}
         {activeTab === 'escanear' && (
           <div className="flex flex-col items-center justify-center h-full space-y-6">
             <h2 className="text-xl font-semibold text-slate-800">Escáner de Aretes</h2>
-            <div className="w-full bg-white p-4 rounded-xl shadow-lg">
-               <Scanner onScanSuccess={handleScan} isScanning={activeTab === 'escanear'} />
-            </div>
-            
-            <p className="text-sm text-slate-500 text-center max-w-xs">
-              Apunta la cámara al código de barras. 
-              <br/>
-              <span className="font-semibold text-emerald-600">El sistema cerrará el escáner automáticamente.</span>
-            </p>
-          </div>
-        )}
-
-        {/* VIEW: LIST */}
-        {activeTab === 'lista' && (
-          <div className="space-y-4">
-            
-            {/* Loading Indicator (Only initial) */}
-            {isLoadingData && (
-                <div className="flex justify-center items-center py-8 text-emerald-600 animate-pulse gap-2">
-                    <RefreshCw size={20} className="animate-spin" />
-                    <span className="font-medium">Sincronizando datos...</span>
+            {!activeLoteId ? (
+                <div className="bg-yellow-50 border border-yellow-200 p-6 rounded-xl text-center max-w-xs">
+                    <AlertTriangle size={48} className="mx-auto text-yellow-500 mb-3" />
+                    <h3 className="font-bold text-yellow-800 mb-2">Sin Lote Activo</h3>
+                    <p className="text-sm text-yellow-700 mb-4">Debes registrar o seleccionar un lote antes de escanear.</p>
+                    <button onClick={() => setActiveTab('lotes')} className="bg-emerald-600 text-white px-4 py-2 rounded-lg w-full font-medium">
+                        Ir a Lotes
+                    </button>
                 </div>
+            ) : activeLote?.cerrado ? (
+                <div className="bg-red-50 border border-red-200 p-6 rounded-xl text-center max-w-xs">
+                    <Lock size={48} className="mx-auto text-red-500 mb-3" />
+                    <h3 className="font-bold text-red-800 mb-2">Lote Cerrado</h3>
+                    <p className="text-sm text-red-700 mb-4">El lote actual está cerrado. Reábrelo para continuar.</p>
+                    <button onClick={() => setActiveTab('lotes')} className="bg-red-600 text-white px-4 py-2 rounded-lg w-full font-medium">
+                        Gestionar Lotes
+                    </button>
+                </div>
+            ) : (
+                <>
+                    <div className="w-full bg-white p-4 rounded-xl shadow-lg relative">
+                        <div className="absolute -top-3 left-0 right-0 flex justify-center">
+                            <span className="bg-emerald-100 text-emerald-800 text-xs font-bold px-3 py-1 rounded-full border border-emerald-200">
+                                Guardando en: {isUnassignedView ? 'Sin Lote Asignado' : activeLote?.nombre}
+                            </span>
+                        </div>
+                        <Scanner onScanSuccess={handleScan} isScanning={activeTab === 'escanear'} />
+                    </div>
+                    <p className="text-sm text-slate-500 text-center max-w-xs">
+                        Apunta la cámara al código de barras.
+                    </p>
+                </>
             )}
-
-            {/* Stats Summary */}
-            {!isLoadingData && <Stats aretes={aretes} />}
-
-            {/* Search and Filters */}
-            <div className="flex gap-2 mb-4">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-                <input 
-                  type="text" 
-                  placeholder="Buscar arete..." 
-                  className="w-full pl-10 pr-4 py-3 rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 shadow-sm transition-all"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-              </div>
-            </div>
-
-            {/* List */}
-            <div className="space-y-3">
-              {!isLoadingData && filteredAretes.length === 0 ? (
-                <div className="text-center py-12 text-slate-400">
-                  <ScanLine size={48} className="mx-auto mb-3 opacity-20" />
-                  <p>No hay aretes registrados en la nube.</p>
-                  <p className="text-sm">Ve a la pestaña "Escanear" para comenzar.</p>
-                </div>
-              ) : (
-                filteredAretes.map(arete => (
-                  <TagItem 
-                    key={arete.id} 
-                    arete={arete} 
-                    onUpdateStatus={handleUpdateStatus} 
-                    onDelete={handleDelete}
-                  />
-                ))
-              )}
-            </div>
-            
-             {aretes.length > 0 && (
-                <div className="mt-8 flex justify-center">
-                   <button onClick={handleClearAll} className="text-red-400 text-xs hover:text-red-600 flex items-center gap-1 border border-red-100 px-3 py-2 rounded bg-red-50">
-                      <Trash size={12} /> Limpiar Base de Datos (Admin)
-                   </button>
-                </div>
-             )}
           </div>
         )}
 
-        {/* VIEW: REPORT BY DATE */}
+        {/* VIEW: LISTA Y LOTES (Unified View) */}
+        {(activeTab === 'lista' || activeTab === 'lotes') && (
+            <div className="space-y-4">
+                
+                {/* Unified Toggle / Switcher */}
+                <div className="bg-white p-1 rounded-xl shadow-sm border border-slate-200 flex mb-4">
+                    <button 
+                        onClick={() => setActiveTab('lista')}
+                        className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all
+                            ${activeTab === 'lista' ? 'bg-emerald-100 text-emerald-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                        <FileText size={16} /> Lista Actual
+                    </button>
+                    <button 
+                        onClick={() => setActiveTab('lotes')}
+                        className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all
+                            ${activeTab === 'lotes' ? 'bg-blue-100 text-blue-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                        <Folder size={16} /> Historial Lotes
+                    </button>
+                </div>
+
+                {/* --- SUB-VIEW: LISTA --- */}
+                {activeTab === 'lista' && (
+                    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+                        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 mb-4">
+                            {!activeLoteId ? (
+                                <div className="text-center py-4">
+                                    <p className="text-slate-500 mb-3">No hay un lote seleccionado.</p>
+                                    <button 
+                                        onClick={handleCreateLote}
+                                        className="bg-emerald-600 text-white px-6 py-2 rounded-lg font-medium shadow-lg hover:scale-105 transition-transform"
+                                    >
+                                        Crear Primer Lote
+                                    </button>
+                                </div>
+                            ) : (
+                                <div>
+                                    <div className="flex justify-between items-start mb-4">
+                                        <div>
+                                            <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                                                {isUnassignedView ? "Aretes Sin Lote" : activeLote?.nombre}
+                                                {!isUnassignedView && activeLote?.cerrado && <Lock size={16} className="text-red-500" />}
+                                            </h2>
+                                            <p className="text-xs text-slate-500">
+                                                {isUnassignedView 
+                                                    ? "Registros antiguos o sin asignar" 
+                                                    : `Creado: ${new Date(activeLote!.fechaCreacion).toLocaleString('es-MX')}`
+                                                }
+                                            </p>
+                                        </div>
+                                        
+                                        {!isUnassignedView && (
+                                            <button 
+                                                onClick={() => handleToggleLoteStatus(activeLote!)}
+                                                className={`px-3 py-1.5 rounded-lg text-xs font-bold border flex items-center gap-1 transition-colors
+                                                    ${activeLote?.cerrado 
+                                                        ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' 
+                                                        : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'
+                                                    }`}
+                                            >
+                                                {activeLote?.cerrado ? <Unlock size={14} /> : <Lock size={14} />}
+                                                {activeLote?.cerrado ? "REABRIR" : "CERRAR"}
+                                            </button>
+                                        )}
+                                    </div>
+
+                                    <div className="flex gap-2">
+                                        <div className="relative flex-1">
+                                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+                                            <input 
+                                            type="text" 
+                                            placeholder="Buscar arete..." 
+                                            className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                            value={searchTerm}
+                                            onChange={(e) => setSearchTerm(e.target.value)}
+                                            />
+                                        </div>
+                                        <ExportButton aretes={filteredAretes} />
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {activeLoteId && (
+                            <>
+                                {/* Siempre mostrar Stats (que contiene la imagen del toro) */}
+                                <Stats aretes={aretesDelLote} />
+
+                                <div className="space-y-3">
+                                {!isLoadingData && filteredAretes.length === 0 ? (
+                                    <div className="text-center py-8 text-slate-400">
+                                        <div className="inline-block p-3 bg-slate-100 rounded-full mb-2">
+                                            <List size={24} className="opacity-40" />
+                                        </div>
+                                        <p className="text-sm">Lista vacía. Usa el botón central para escanear.</p>
+                                    </div>
+                                ) : (
+                                    filteredAretes.map(arete => (
+                                    <TagItem 
+                                        key={arete.id} 
+                                        arete={arete} 
+                                        onUpdateStatus={handleUpdateStatus} 
+                                        onDelete={handleDelete}
+                                    />
+                                    ))
+                                )}
+                                </div>
+                            </>
+                        )}
+                    </div>
+                )}
+
+                {/* --- SUB-VIEW: LOTES (HISTORIAL) --- */}
+                {activeTab === 'lotes' && (
+                    <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                        <button 
+                            onClick={handleCreateLote}
+                            className="w-full bg-white border-2 border-dashed border-emerald-300 hover:border-emerald-500 hover:bg-emerald-50 text-emerald-700 p-4 rounded-xl flex items-center justify-center gap-2 font-bold transition-all group"
+                        >
+                            <FolderPlus className="group-hover:scale-110 transition-transform" />
+                            Crear Nuevo Lote
+                        </button>
+
+                        {aretesSinLoteCount > 0 && (
+                            <div 
+                            onClick={() => handleActivateLote(UNASSIGNED_LOTE_ID)}
+                            className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-center justify-between group
+                                ${activeLoteId === UNASSIGNED_LOTE_ID 
+                                ? 'bg-amber-50 border-amber-500 shadow-md' 
+                                : 'bg-white border-slate-100 hover:border-amber-200 hover:shadow-sm'
+                                }
+                            `}
+                            >
+                            <div className="flex items-start gap-3">
+                                <div className={`p-2 rounded-lg ${activeLoteId === UNASSIGNED_LOTE_ID ? 'bg-amber-200 text-amber-800' : 'bg-slate-100 text-slate-500'}`}>
+                                <Archive size={20} />
+                                </div>
+                                <div>
+                                <h4 className={`font-bold ${activeLoteId === UNASSIGNED_LOTE_ID ? 'text-amber-900' : 'text-slate-700'}`}>
+                                    Sin Lote / Antiguos
+                                </h4>
+                                <div className="mt-1">
+                                    <span className="text-xs font-semibold bg-slate-100 px-2 py-0.5 rounded text-slate-600">
+                                    {aretesSinLoteCount} registros
+                                    </span>
+                                    {activeLoteId === UNASSIGNED_LOTE_ID && <span className="ml-2 text-xs font-bold text-amber-600">● VIENDO</span>}
+                                </div>
+                                </div>
+                            </div>
+                            </div>
+                        )}
+
+                        {lotes.length === 0 && aretesSinLoteCount === 0 ? (
+                            <div className="text-center py-12">
+                                <p className="text-slate-400">No hay historial de lotes.</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-3">
+                                {lotes.map(lote => (
+                                    <LotItem 
+                                        key={lote.id} 
+                                        lote={lote} 
+                                        isActive={activeLoteId === lote.id}
+                                        totalAretes={aretes.filter(a => a.loteId === lote.id).length}
+                                        onActivate={() => handleActivateLote(lote.id)}
+                                    />
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        )}
+
+        {/* VIEW: REPORT */}
         {activeTab === 'analisis' && (
           <div className="space-y-6">
             <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100">
@@ -229,7 +500,10 @@ const App: React.FC = () => {
                 <div className="bg-violet-100 p-2 rounded-lg">
                   <CalendarRange size={24} className="text-violet-600" />
                 </div>
-                <h2 className="text-xl font-bold text-slate-800">Reporte Histórico</h2>
+                <div>
+                    <h2 className="text-xl font-bold text-slate-800">Reporte Global</h2>
+                    <p className="text-xs text-slate-500">Histórico de todos los lotes</p>
+                </div>
               </div>
 
               {reportePorFecha.length === 0 ? (
@@ -274,40 +548,141 @@ const App: React.FC = () => {
                 </div>
               )}
             </div>
-            
-            {aretes.length > 0 && (
-                <div className="flex justify-center">
-                    <ExportButton aretes={aretes} />
-                </div>
-            )}
           </div>
         )}
-
       </main>
 
-      {/* Bottom Navigation */}
-      <nav className="fixed bottom-0 w-full max-w-2xl bg-white border-t border-slate-200 p-2 pb-safe flex justify-around shadow-lg z-50">
+      {/* --- MODALES PERSONALIZADOS --- */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden scale-100 animate-in zoom-in-95 duration-200">
+                <div className="bg-emerald-600 p-4 flex justify-between items-center text-white">
+                    <h3 className="font-bold text-lg flex items-center gap-2">
+                        <FolderPlus size={20} /> Nuevo Lote
+                    </h3>
+                    <button onClick={() => setShowCreateModal(false)} className="hover:bg-emerald-700 p-1 rounded-full transition-colors">
+                        <X size={20} />
+                    </button>
+                </div>
+                
+                <div className="p-6">
+                    <div className="mb-4">
+                        <label className="block text-sm font-medium text-slate-700 mb-1">Nombre del Lote</label>
+                        <input 
+                            type="text" 
+                            value={createName}
+                            onChange={(e) => setCreateName(e.target.value)}
+                            className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none font-medium"
+                            placeholder="Ej. Lote 12 Octubre"
+                            autoFocus
+                        />
+                    </div>
+
+                    {activeLote && !activeLote.cerrado && (
+                        <div className="mb-6 bg-amber-50 border border-amber-200 rounded-lg p-3 flex gap-3 items-start">
+                            <AlertTriangle className="text-amber-500 shrink-0 mt-0.5" size={18} />
+                            <div className="text-xs text-amber-800">
+                                <span className="font-bold">Nota:</span> El lote actual <strong>"{activeLote.nombre}"</strong> se cerrará automáticamente.
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="flex gap-3">
+                        <button 
+                            onClick={() => setShowCreateModal(false)}
+                            className="flex-1 py-2.5 text-slate-600 font-bold hover:bg-slate-50 rounded-lg transition-colors border border-transparent hover:border-slate-200"
+                        >
+                            Cancelar
+                        </button>
+                        <button 
+                            onClick={executeCreateLote}
+                            className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg shadow-lg shadow-emerald-200 transition-all"
+                        >
+                            Crear Lote
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+      )}
+
+      {alertConfig.isOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden scale-100 animate-in zoom-in-95 duration-200">
+                <div className={`p-4 flex items-center gap-3 border-b ${alertConfig.isDestructive ? 'bg-red-50 border-red-100' : 'bg-white border-slate-100'}`}>
+                    {alertConfig.isDestructive || alertConfig.type === 'alert' ? (
+                         <AlertTriangle className={alertConfig.isDestructive ? "text-red-500" : "text-amber-500"} size={24} />
+                    ) : (
+                         <CheckCircle2 className="text-emerald-500" size={24} />
+                    )}
+                    <h3 className={`font-bold text-lg ${alertConfig.isDestructive ? 'text-red-800' : 'text-slate-800'}`}>
+                        {alertConfig.title}
+                    </h3>
+                </div>
+                <div className="p-6">
+                    <p className="text-slate-600 mb-6 leading-relaxed">
+                        {alertConfig.message}
+                    </p>
+                    <div className="flex gap-3 justify-end">
+                        {alertConfig.type === 'confirm' && (
+                            <button 
+                                onClick={() => setAlertConfig(prev => ({...prev, isOpen: false}))}
+                                className="px-4 py-2 text-slate-500 font-bold hover:bg-slate-50 rounded-lg transition-colors"
+                            >
+                                Cancelar
+                            </button>
+                        )}
+                        <button 
+                            onClick={() => {
+                                if (alertConfig.onConfirm) alertConfig.onConfirm();
+                                else setAlertConfig(prev => ({...prev, isOpen: false}));
+                            }}
+                            className={`px-6 py-2 text-white font-bold rounded-lg shadow-md transition-all
+                                ${alertConfig.isDestructive 
+                                    ? 'bg-red-600 hover:bg-red-700 shadow-red-200' 
+                                    : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'
+                                }`}
+                        >
+                            {alertConfig.confirmText || "Aceptar"}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+      )}
+
+      {/* Bottom Navigation Refactored */}
+      <nav className="fixed bottom-0 w-full max-w-2xl bg-white border-t border-slate-200 p-2 pb-safe flex justify-between items-end shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] z-50">
+        
+        {/* BOTÓN IZQUIERDO: Registros (Lista + Lotes) */}
         <button 
           onClick={() => setActiveTab('lista')}
-          className={`flex flex-col items-center p-2 rounded-lg transition-all ${activeTab === 'lista' ? 'text-emerald-600 bg-emerald-50' : 'text-slate-400'}`}
+          className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all 
+            ${(activeTab === 'lista' || activeTab === 'lotes') ? 'text-emerald-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}
         >
-          <List size={24} />
-          <span className="text-xs font-medium mt-1">Lista</span>
+          <List size={26} strokeWidth={activeTab === 'lista' || activeTab === 'lotes' ? 2.5 : 2} />
+          <span className="text-[11px] font-medium mt-1">Registros</span>
         </button>
         
-        <button 
-          onClick={() => setActiveTab('escanear')}
-          className="flex flex-col items-center justify-center -mt-8 bg-emerald-600 text-white rounded-full w-16 h-16 shadow-xl border-4 border-slate-50 hover:bg-emerald-700 hover:scale-105 transition-all"
-        >
-          <ScanLine size={28} />
-        </button>
+        {/* BOTÓN CENTRAL: Escanear (Flotante) */}
+        <div className="relative -top-6 px-2">
+            <button 
+            onClick={() => setActiveTab('escanear')}
+            className={`flex flex-col items-center justify-center bg-emerald-600 text-white rounded-full w-16 h-16 shadow-xl border-4 border-slate-50 hover:bg-emerald-700 hover:scale-105 transition-all
+                ${activeTab === 'escanear' ? 'ring-4 ring-emerald-200' : ''}`}
+            >
+            <ScanLine size={30} />
+            </button>
+        </div>
 
+        {/* BOTÓN DERECHO: Reportes */}
         <button 
           onClick={() => setActiveTab('analisis')}
-          className={`flex flex-col items-center p-2 rounded-lg transition-all ${activeTab === 'analisis' ? 'text-violet-600 bg-violet-50' : 'text-slate-400'}`}
+          className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all 
+            ${activeTab === 'analisis' ? 'text-violet-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}
         >
-          <CalendarRange size={24} />
-          <span className="text-xs font-medium mt-1">Reporte</span>
+          <CalendarRange size={26} strokeWidth={activeTab === 'analisis' ? 2.5 : 2} />
+          <span className="text-[11px] font-medium mt-1">Reporte</span>
         </button>
       </nav>
     </div>

@@ -1,52 +1,84 @@
-import { Arete, EstadoArete } from '../types';
+import { Arete, EstadoArete, Lote } from '../types';
 
-const STORAGE_KEY = 'ganadoscan_aretes_v1';
+const STORAGE_KEY_ARETES = 'ganadoscan_aretes_v1';
+const STORAGE_KEY_LOTES = 'ganadoscan_lotes_v1';
 
 export const StorageService = {
-  obtenerAretes: (): Arete[] => {
+  // Helpers internos síncronos
+  _getAretes: (): Arete[] => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
+      const stored = localStorage.getItem(STORAGE_KEY_ARETES);
       return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      console.error("Error al leer storage", e);
-      return [];
-    }
+    } catch (e) { return []; }
+  },
+  _getLotes: (): Lote[] => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY_LOTES);
+      return stored ? JSON.parse(stored) : [];
+    } catch (e) { return []; }
   },
 
-  guardarArete: (codigo: string): Arete => {
-    const aretes = StorageService.obtenerAretes();
+  // --- INTERFAZ ASÍNCRONA PARA COMPATIBILIDAD CON APP ---
+
+  // Lotes
+  obtenerLotes: async (): Promise<Lote[]> => {
+    const lotes = StorageService._getLotes();
+    return lotes.sort((a, b) => new Date(b.fechaCreacion).getTime() - new Date(a.fechaCreacion).getTime());
+  },
+
+  crearLote: async (nombre: string): Promise<Lote> => {
+    const lotes = StorageService._getLotes();
+    const nuevoLote: Lote = {
+      id: crypto.randomUUID(),
+      nombre,
+      fechaCreacion: new Date().toISOString(),
+      cerrado: false
+    };
+    localStorage.setItem(STORAGE_KEY_LOTES, JSON.stringify([nuevoLote, ...lotes]));
+    return nuevoLote;
+  },
+
+  actualizarEstadoLote: async (id: string, cerrado: boolean): Promise<void> => {
+    const lotes = StorageService._getLotes();
+    const updated = lotes.map(l => l.id === id ? { ...l, cerrado } : l);
+    localStorage.setItem(STORAGE_KEY_LOTES, JSON.stringify(updated));
+  },
+
+  // Aretes
+  obtenerAretes: async (): Promise<Arete[]> => {
+    const aretes = StorageService._getAretes();
+    return aretes.sort((a, b) => new Date(b.fechaEscaneo).getTime() - new Date(a.fechaEscaneo).getTime());
+  },
+
+  guardarArete: async (codigo: string, loteId?: string): Promise<void> => {
+    const aretes = StorageService._getAretes();
+    // Validar si loteId es 'unassigned', guardarlo como undefined o null
+    const finalLoteId = loteId === 'unassigned' ? undefined : loteId;
     
-    // Evitar duplicados exactos en el mismo día si se desea, 
-    // pero para este caso permitiremos entradas múltiples con timestamps diferentes
     const nuevoArete: Arete = {
       id: crypto.randomUUID(),
-      codigo: codigo,
+      codigo,
       fechaEscaneo: new Date().toISOString(),
-      estado: EstadoArete.PENDIENTE
+      estado: EstadoArete.PENDIENTE,
+      loteId: finalLoteId
     };
-
-    const nuevosAretes = [nuevoArete, ...aretes];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(nuevosAretes));
-    return nuevoArete;
+    localStorage.setItem(STORAGE_KEY_ARETES, JSON.stringify([nuevoArete, ...aretes]));
   },
 
-  actualizarEstado: (id: string, nuevoEstado: EstadoArete): Arete[] => {
-    const aretes = StorageService.obtenerAretes();
-    const actualizados = aretes.map(arete => 
-      arete.id === id ? { ...arete, estado: nuevoEstado } : arete
-    );
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(actualizados));
-    return actualizados;
+  actualizarEstado: async (id: string, nuevoEstado: EstadoArete): Promise<void> => {
+    const aretes = StorageService._getAretes();
+    const updated = aretes.map(a => a.id === id ? { ...a, estado: nuevoEstado } : a);
+    localStorage.setItem(STORAGE_KEY_ARETES, JSON.stringify(updated));
   },
 
-  eliminarArete: (id: string): Arete[] => {
-    const aretes = StorageService.obtenerAretes();
-    const filtrados = aretes.filter(a => a.id !== id);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(filtrados));
-    return filtrados;
+  eliminarArete: async (id: string): Promise<void> => {
+    const aretes = StorageService._getAretes();
+    const filtered = aretes.filter(a => a.id !== id);
+    localStorage.setItem(STORAGE_KEY_ARETES, JSON.stringify(filtered));
   },
 
-  limpiarTodo: (): void => {
-    localStorage.removeItem(STORAGE_KEY);
+  limpiarTodo: async (): Promise<void> => {
+    localStorage.removeItem(STORAGE_KEY_ARETES);
+    localStorage.removeItem(STORAGE_KEY_LOTES);
   }
 };
