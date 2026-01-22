@@ -4,7 +4,7 @@ import { Arete, EstadoArete, Lote } from '../types';
 export const SupabaseService = {
   // --- LOTES ---
 
-  obtenerLotes: async (): Promise<Lote[]> => {
+  obtenerLotes: async (): Promise<Lote[] | null> => {
     const { data, error } = await supabase
       .from('lotes')
       .select('*')
@@ -12,7 +12,8 @@ export const SupabaseService = {
 
     if (error) {
       console.error('Error fetching lotes:', error);
-      return [];
+      // RETORNAR NULL EN LUGAR DE [] ES CRÍTICO PARA NO BORRAR LA CACHÉ OFFLINE
+      return null;
     }
 
     return data.map((item: any) => ({
@@ -23,10 +24,14 @@ export const SupabaseService = {
     }));
   },
 
-  crearLote: async (nombre: string): Promise<Lote | null> => {
+  // MODIFICADO: Acepta ID opcional para sincronización offline
+  crearLote: async (nombre: string, id?: string): Promise<Lote | null> => {
+    const payload: any = { nombre, cerrado: false };
+    if (id) payload.id = id;
+
     const { data, error } = await supabase
       .from('lotes')
-      .insert([{ nombre, cerrado: false }])
+      .insert([payload])
       .select()
       .single();
 
@@ -53,8 +58,7 @@ export const SupabaseService = {
   },
 
   eliminarLote: async (id: string): Promise<void> => {
-    // Primero eliminamos los aretes asociados para asegurar integridad 
-    // (aunque la DB podría tener CASCADE, es mejor ser explícito desde el cliente si no controlamos la DB)
+    // Primero eliminamos los aretes asociados
     const { error: errorAretes } = await supabase
         .from('aretes')
         .delete()
@@ -79,8 +83,7 @@ export const SupabaseService = {
 
   // --- ARETES ---
 
-  // Obtener todos los aretes
-  obtenerAretes: async (): Promise<Arete[]> => {
+  obtenerAretes: async (): Promise<Arete[] | null> => {
     const { data, error } = await supabase
       .from('aretes')
       .select('*')
@@ -88,7 +91,8 @@ export const SupabaseService = {
 
     if (error) {
       console.error('Error fetching aretes:', error);
-      return [];
+      // RETORNAR NULL EN LUGAR DE [] ES CRÍTICO PARA NO BORRAR LA CACHÉ OFFLINE
+      return null;
     }
 
     return data.map((item: any) => ({
@@ -101,7 +105,6 @@ export const SupabaseService = {
     }));
   },
 
-  // Guardar un nuevo arete vinculado a un lote
   guardarArete: async (codigo: string, loteId?: string): Promise<void> => {
     const { error } = await supabase
       .from('aretes')
@@ -117,7 +120,6 @@ export const SupabaseService = {
     if (error) console.error('Error insertando arete:', error);
   },
 
-  // Actualizar estado
   actualizarEstado: async (id: string, nuevoEstado: EstadoArete): Promise<void> => {
     const { error } = await supabase
       .from('aretes')
@@ -127,7 +129,6 @@ export const SupabaseService = {
     if (error) console.error('Error actualizando estado:', error);
   },
 
-  // Eliminar arete
   eliminarArete: async (id: string): Promise<void> => {
     const { error } = await supabase
       .from('aretes')
@@ -137,10 +138,7 @@ export const SupabaseService = {
     if (error) console.error('Error eliminando arete:', error);
   },
 
-  // Eliminar todo (peligroso, para el botón de limpiar)
   limpiarTodo: async (): Promise<void> => {
-     // Borra aretes primero por FK
      await supabase.from('aretes').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-     // Podría borrar lotes, pero por seguridad mejor dejarlos o borrarlos aparte
   }
 };

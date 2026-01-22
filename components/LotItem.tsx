@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { memo } from 'react';
 import { Lote } from '../types';
 import { FolderOpen, FolderClosed, CalendarClock, ArrowRight, Trash2 } from 'lucide-react';
 
@@ -66,4 +66,4 @@ const LotItem: React.FC<LotItemProps> = ({ lote, isActive, totalAretes, onActiva
   );
 };
 
-export default LotItem;
+export default memo(LotItem);

@@ -1,23 +1,38 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Arete, EstadoArete, Tab, Lote } from './types';
-import { SupabaseService } from './services/supabaseService'; // Cambiado a Supabase
-import { supabase } from './services/supabaseClient'; // Cliente para Realtime
-import { OfflineStorage } from './services/offlineStorage'; // Servicio cola offline
+import { SupabaseService } from './services/supabaseService';
+import { supabase } from './services/supabaseClient';
+import { OfflineStorage } from './services/offlineStorage';
 import Scanner from './components/Scanner';
 import TagItem from './components/TagItem';
 import ExportButton from './components/ExportButton';
 import Stats from './components/Stats';
 import LotItem from './components/LotItem';
-import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText, Wifi, WifiOff, Loader2, CloudUpload } from 'lucide-react';
+import { ScanLine, List, CalendarRange, Search, FolderPlus, FolderOpen, History, Lock, Unlock, AlertTriangle, CheckCircle2, XCircle, Archive, X, Folder, FileText, Wifi, WifiOff, Loader2, CloudUpload, CloudDownload, Download } from 'lucide-react';
 
 const UNASSIGNED_LOTE_ID = 'unassigned';
+
+// Helper seguro para UUID
+const safeUUID = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('lista');
   const [aretes, setAretes] = useState<Arete[]>([]);
   const [lotes, setLotes] = useState<Lote[]>([]);
-  const [activeLoteId, setActiveLoteId] = useState<string | null>(null);
+  
+  // Inicializar estado del Lote Activo recuperándolo de memoria si existe
+  const [activeLoteId, setActiveLoteId] = useState<string | null>(() => {
+      return OfflineStorage.obtenerLoteActivo();
+  });
   
   const [searchTerm, setSearchTerm] = useState('');
   const [isLoadingData, setIsLoadingData] = useState(true);
@@ -26,6 +41,7 @@ const App: React.FC = () => {
   // Estado de conexión y sincronización
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false); // Nuevo estado para descarga manual
   const [connectionStatus, setConnectionStatus] = useState<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED'>('CONNECTING');
   const [connectionRetry, setConnectionRetry] = useState(0);
 
@@ -43,85 +59,163 @@ const App: React.FC = () => {
     confirmText?: string;
   }>({ isOpen: false, type: 'alert', title: '', message: '' });
 
+  // Efecto para persistir siempre el Lote Activo cuando cambia
+  useEffect(() => {
+      OfflineStorage.guardarLoteActivo(activeLoteId);
+  }, [activeLoteId]);
+
   // Función para procesar la cola offline (Sincronización)
   const processSyncQueue = useCallback(async () => {
     if (!navigator.onLine || isSyncing) return;
-    
-    const queue = OfflineStorage.obtenerCola();
-    if (queue.length === 0) return;
-
     setIsSyncing(true);
-    let syncedCount = 0;
 
-    for (const item of queue) {
-        try {
-            // Intentamos enviar a Supabase
-            // Nota: guardarArete en el servicio espera argumentos simples, 
-            // no el objeto completo con ID, así que insertamos uno nuevo.
-            // Si quisiéramos preservar el ID local UUID sería más complejo, 
-            // pero para este caso basta con recrearlo en el server.
-            await SupabaseService.guardarArete(item.codigo, item.loteId || undefined);
-            
-            // Si éxito, borrar de la cola local
-            OfflineStorage.removerDeCola(item.id);
-            syncedCount++;
-        } catch (error) {
-            console.error("Fallo sincronización item", item.codigo, error);
-            // Si falla, se queda en la cola para el próximo intento
+    try {
+        // 1. PRIMERO Sincronizar LOTES creados offline
+        const lotesQueue = OfflineStorage.obtenerLotesCola();
+        for (const lote of lotesQueue) {
+            try {
+                // Intentar crear en servidor
+                const serverLote = await SupabaseService.crearLote(lote.nombre, lote.id);
+                if (serverLote) {
+                    OfflineStorage.removerLoteCola(lote.id);
+                    console.log("Sincronizado Lote:", lote.nombre);
+                }
+            } catch (error) {
+                console.error("Fallo sync lote", lote.nombre, error);
+            }
         }
-    }
-    
-    setIsSyncing(false);
-    if (syncedCount > 0) {
-        // Refrescar datos del servidor para obtener los IDs reales y timestamps del servidor
-        // Opcional: mostrar un toast de "Sincronizado"
+
+        // 2. DESPUÉS Sincronizar ARETES
+        const aretesQueue = OfflineStorage.obtenerCola();
+        if (aretesQueue.length > 0) {
+            let syncedCount = 0;
+            for (const item of aretesQueue) {
+                try {
+                    await SupabaseService.guardarArete(item.codigo, item.loteId || undefined);
+                    OfflineStorage.removerDeCola(item.id);
+                    syncedCount++;
+                } catch (error) {
+                    console.error("Fallo sincronización item", item.codigo, error);
+                }
+            }
+        }
+        
+    } catch (e) {
+        console.error("Error general en sync", e);
+    } finally {
+        setIsSyncing(false);
     }
   }, [isSyncing]);
 
-  // Función para cargar datos (reutilizable)
-  const fetchData = useCallback(async (isInitialLoad = false) => {
-    if (isInitialLoad) setIsLoadingData(true);
-    try {
-      // 1. Obtener datos del servidor
-      const [aretesData, lotesData] = await Promise.all([
-        SupabaseService.obtenerAretes(),
-        SupabaseService.obtenerLotes()
-      ]);
-      
-      // 2. Obtener datos de la cola offline (pendientes de subir)
-      const offlineQueue = OfflineStorage.obtenerCola();
+  // Lógica centralizada de obtención y mezcla de datos
+  const fetchInternalData = async (forceServer = false) => {
+      // 1. Obtener colas locales (lo que he creado y no ha subido)
+      const localLotesQueue = OfflineStorage.obtenerLotesCola();
+      const localAretesQueue = OfflineStorage.obtenerCola();
 
-      // 3. Mezclar listas (Servidor + Offline)
-      // Los offline van primero o integrados. Agregamos flag sincronizado=true a los del server
-      const serverAretes = aretesData.map(a => ({ ...a, sincronizado: true }));
+      // 2. Obtener caché (lo último que supe del servidor)
+      let cachedLotes = OfflineStorage.obtenerLotesCache();
+      let cachedAretes = OfflineStorage.obtenerAretesCache();
+
+      // 3. Si hay red, intentar actualizar la caché desde el servidor
+      if ((navigator.onLine || forceServer) && !isDownloading) {
+          try {
+              const [serverAretes, serverLotes] = await Promise.all([
+                  SupabaseService.obtenerAretes(),
+                  SupabaseService.obtenerLotes()
+              ]);
+              
+              if (serverLotes !== null) {
+                  OfflineStorage.guardarLotesCache(serverLotes);
+                  cachedLotes = serverLotes;
+              }
+              if (serverAretes !== null) {
+                  OfflineStorage.guardarAretesCache(serverAretes);
+                  cachedAretes = serverAretes;
+              }
+          } catch (e) {
+              console.warn("Fallo conexión servidor, usando caché disponible", e);
+          }
+      }
+
+      // 4. MEZCLA INTELIGENTE (Merge)
+      // Prioridad: Cola Local > Servidor/Caché
       
-      // Combinamos. Si hay duplicados de ID (raro pq offline usa uuid), priorizamos offline queue visualmente?
-      // Mejor: Mostrar todo.
-      const combinedAretes = [...offlineQueue, ...serverAretes].sort((a, b) => 
+      const lotesMap = new Map<string, Lote>();
+      cachedLotes.forEach(l => lotesMap.set(l.id, l));
+      localLotesQueue.forEach(l => lotesMap.set(l.id, l));
+      
+      const mergedLotes = Array.from(lotesMap.values()).sort((a, b) => 
+          new Date(b.fechaCreacion).getTime() - new Date(a.fechaCreacion).getTime()
+      );
+
+      const aretesMap = new Map<string, Arete>();
+      cachedAretes.forEach(a => aretesMap.set(a.id, { ...a, sincronizado: true }));
+      localAretesQueue.forEach(a => aretesMap.set(a.id, { ...a, sincronizado: false }));
+
+      const mergedAretes = Array.from(aretesMap.values()).sort((a, b) => 
           new Date(b.fechaEscaneo).getTime() - new Date(a.fechaEscaneo).getTime()
       );
-      
-      setAretes(combinedAretes);
-      setLotes(lotesData);
-      
-      return { aretesData: combinedAretes, lotesData };
-    } catch (e) {
-      console.error("Error fetching data", e);
-      // Fallback: si no hay red, mostrar solo offline queue y lo que haya en caché si implementáramos caché local de todo
-      const offlineQueue = OfflineStorage.obtenerCola();
-      setAretes(offlineQueue);
-      return null;
-    } finally {
-      if (isInitialLoad) setIsLoadingData(false);
+
+      return { aretes: mergedAretes, lotes: mergedLotes };
+  };
+
+  const updateUI = useCallback(async (isInitial = false) => {
+      if (isInitial) setIsLoadingData(true);
+      const data = await fetchInternalData(isInitial);
+      setLotes(data.lotes);
+      setAretes(data.aretes);
+      if (isInitial) setIsLoadingData(false);
+      return data;
+  }, [isDownloading]); // Dependencias estables
+
+  // --- NUEVA FUNCIÓN: DESCARGA MANUAL PARA OFFLINE ---
+  const handleDownloadOfflineData = async () => {
+    if (!navigator.onLine) {
+        setAlertConfig({ 
+            isOpen: true, type: 'alert', title: 'Sin Conexión', 
+            message: 'Necesitas internet para descargar los datos.' 
+        });
+        return;
     }
-  }, []);
+
+    setIsDownloading(true);
+    try {
+        const [serverAretes, serverLotes] = await Promise.all([
+            SupabaseService.obtenerAretes(),
+            SupabaseService.obtenerLotes()
+        ]);
+
+        if (serverAretes === null || serverLotes === null) {
+            throw new Error("La descarga devolvió datos incompletos.");
+        }
+
+        OfflineStorage.guardarLotesCache(serverLotes);
+        OfflineStorage.guardarAretesCache(serverAretes);
+
+        await updateUI(false);
+
+        setAlertConfig({ 
+            isOpen: true, type: 'alert', title: 'Datos Descargados', 
+            message: '¡Listo! Ya puedes desconectarte y trabajar sin internet. Los datos están guardados en tu celular.' 
+        });
+
+    } catch (e) {
+        console.error("Error en descarga manual", e);
+        setAlertConfig({ 
+            isOpen: true, type: 'alert', title: 'Error', 
+            message: 'No se pudieron descargar los datos. Verifica tu conexión e intenta de nuevo.' 
+        });
+    } finally {
+        setIsDownloading(false);
+    }
+  };
 
   // Monitor de estado de red
   useEffect(() => {
     const handleOnline = () => {
         setIsOnline(true);
-        processSyncQueue(); // Intentar sincronizar al volver
-        // Reconectar realtime
+        processSyncQueue().then(() => updateUI(false));
         setConnectionRetry(prev => prev + 1);
     };
     const handleOffline = () => {
@@ -132,7 +226,6 @@ const App: React.FC = () => {
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
-    // Check inicial de cola por si abrimos la app y ya hay internet
     if (navigator.onLine) {
         processSyncQueue();
     }
@@ -141,94 +234,114 @@ const App: React.FC = () => {
         window.removeEventListener('online', handleOnline);
         window.removeEventListener('offline', handleOffline);
     };
-  }, [processSyncQueue]);
+  }, [processSyncQueue, updateUI]);
 
-  // 1. CARGA INICIAL Y REALTIME
+  // Carga inicial y Suscripciones OPTIMIZADAS
   useEffect(() => {
     let isMounted = true;
 
     // Carga inicial
-    if (connectionRetry === 0) {
-        fetchData(true).then((data) => {
-            if (isMounted && data && !activeLoteId) {
-                const ultimoAbierto = data.lotesData.find(l => !l.cerrado);
-                if (ultimoAbierto) {
-                    setActiveLoteId(ultimoAbierto.id);
-                } else {
-                    const hayAretesSinLote = data.aretesData.some(a => !a.loteId);
-                    if (hayAretesSinLote) {
-                        setActiveLoteId(UNASSIGNED_LOTE_ID);
-                    }
-                }
+    updateUI(true).then((data) => {
+        if (!isMounted) return;
+        
+        const savedId = OfflineStorage.obtenerLoteActivo();
+        const isValidSavedId = savedId && (savedId === UNASSIGNED_LOTE_ID || data.lotes.some(l => l.id === savedId));
+
+        if (isValidSavedId) {
+            setActiveLoteId(savedId);
+        } else if (!activeLoteId) {
+            const ultimoAbierto = data.lotes.find(l => !l.cerrado);
+            if (ultimoAbierto) {
+                setActiveLoteId(ultimoAbierto.id);
+            } else if (data.aretes.some(a => !a.loteId)) {
+                setActiveLoteId(UNASSIGNED_LOTE_ID);
             }
-        });
-    } else {
-        // Si es retry (reconectó internet), refrescar datos
-        fetchData(false);
-    }
+        }
+    });
 
-    if (!isOnline) return; // No intentar suscribir si no hay red
+    if (!isOnline) return; 
 
-    // Configuración de Realtime ROBUSTA
+    // --- OPTIMIZACIÓN REALTIME: Actualización Incremental ---
+    // En lugar de recargar TODO con updateUI(false), procesamos solo el cambio
     const channelId = `global-changes-${Date.now()}`;
     const channel = supabase.channel(channelId)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'aretes' },
-        (payload) => {
-          if (!isMounted) return;
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'aretes' }, (payload) => {
+          if (!isMounted || isDownloading) return;
+          
           if (payload.eventType === 'INSERT') {
-            const newRow = payload.new;
-            // Si llega un insert del servidor, verificamos si era uno nuestro de la cola offline
-            // Como el ID será diferente (UUID local vs ID server), es difícil matchear exacto sin un campo extra.
-            // Por simplicidad, refrescamos todo.
-            // Para UX instantánea, agregamos, pero si estamos syncando puede duplicarse visualmente 
-            // hasta que fetchData limpie.
-            fetchData(false);
-            
-            // Vibrar
-            if (!document.hidden && navigator.vibrate) navigator.vibrate(50);
-
-          } else if (payload.eventType === 'UPDATE' || payload.eventType === 'DELETE') {
-             fetchData(false); // Simplificación: recargar para mantener consistencia
+              const newItem: Arete = {
+                  id: payload.new.id,
+                  codigo: payload.new.codigo,
+                  fechaEscaneo: payload.new.fecha_escaneo,
+                  estado: payload.new.estado,
+                  loteId: payload.new.lote_id,
+                  notas: payload.new.notas,
+                  sincronizado: true
+              };
+              setAretes(prev => {
+                  // Evitar duplicados si ya lo tenemos (optimistic UI)
+                  const exists = prev.find(a => a.id === newItem.id);
+                  if (exists) {
+                      // Si existe pero no estaba sincronizado, actualizarlo
+                      if (!exists.sincronizado) {
+                          return prev.map(a => a.id === newItem.id ? { ...newItem, sincronizado: true } : a);
+                      }
+                      return prev;
+                  }
+                  return [newItem, ...prev].sort((a, b) => new Date(b.fechaEscaneo).getTime() - new Date(a.fechaEscaneo).getTime());
+              });
+          } else if (payload.eventType === 'UPDATE') {
+              setAretes(prev => prev.map(a => {
+                  if (a.id === payload.new.id) {
+                      return {
+                          ...a,
+                          codigo: payload.new.codigo,
+                          estado: payload.new.estado,
+                          loteId: payload.new.lote_id,
+                          // Mantener sincronizado true si viene del server
+                          sincronizado: true
+                      };
+                  }
+                  return a;
+              }));
+          } else if (payload.eventType === 'DELETE') {
+              setAretes(prev => prev.filter(a => a.id !== payload.old.id));
           }
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'lotes' },
-        (payload) => {
-            if (!isMounted) return;
-            fetchData(false);
-        }
-      )
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lotes' }, (payload) => {
+          if (!isMounted || isDownloading) return;
+          
+          if (payload.eventType === 'INSERT') {
+               const newLote: Lote = {
+                  id: payload.new.id,
+                  nombre: payload.new.nombre,
+                  fechaCreacion: payload.new.fecha_creacion,
+                  cerrado: payload.new.cerrado
+               };
+               setLotes(prev => {
+                   if (prev.find(l => l.id === newLote.id)) return prev;
+                   return [newLote, ...prev].sort((a, b) => new Date(b.fechaCreacion).getTime() - new Date(a.fechaCreacion).getTime());
+               });
+          } else if (payload.eventType === 'UPDATE') {
+               setLotes(prev => prev.map(l => l.id === payload.new.id ? { ...l, cerrado: payload.new.cerrado, nombre: payload.new.nombre } : l));
+          } else if (payload.eventType === 'DELETE') {
+               setLotes(prev => prev.filter(l => l.id !== payload.old.id));
+          }
+      })
       .subscribe((status) => {
         if (!isMounted) return;
-        if (status === 'SUBSCRIBED') {
-            setConnectionStatus('CONNECTED');
-        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-            setConnectionStatus('DISCONNECTED');
-            // Reintentar si seguimos online
-            if (navigator.onLine) {
-                setTimeout(() => {
-                    if (isMounted) setConnectionRetry(prev => prev + 1);
-                }, 5000);
-            }
-        } else {
-            setConnectionStatus('CONNECTING');
-        }
+        if (status === 'SUBSCRIBED') setConnectionStatus('CONNECTED');
+        else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') setConnectionStatus('DISCONNECTED');
       });
 
     return () => {
       isMounted = false;
       supabase.removeChannel(channel);
     };
-
-  }, [fetchData, connectionRetry, isOnline]);
+  }, [connectionRetry, isOnline, isDownloading, updateUI]); // Dependencias ajustadas
 
   // --- LÓGICA DE LOTES ---
-
-  const activeLote = lotes.find(l => l.id === activeLoteId);
+  const activeLote = useMemo(() => lotes.find(l => l.id === activeLoteId), [lotes, activeLoteId]);
   const isUnassignedView = activeLoteId === UNASSIGNED_LOTE_ID;
 
   const aretesDelLote = useMemo(() => {
@@ -239,79 +352,75 @@ const App: React.FC = () => {
     return aretes.filter(a => a.loteId === activeLoteId);
   }, [aretes, activeLoteId, isUnassignedView]);
 
-  // Handler para ABRIR el modal de creación CON CONSECUTIVO AUTOMÁTICO
-  const handleCreateLote = () => {
+  const handleCreateLote = useCallback(() => {
     const consecutivo = lotes.length + 1;
     const fechaHora = new Date().toLocaleString('es-MX', {
-        day: '2-digit', 
-        month: 'short',
-        hour: '2-digit', 
-        minute:'2-digit'
+        day: '2-digit', month: 'short', hour: '2-digit', minute:'2-digit'
     }).replace('.', '');
-
-    const defaultName = `Lote ${consecutivo} - ${fechaHora}`;
-    setCreateName(defaultName);
+    setCreateName(`Lote ${consecutivo} - ${fechaHora}`);
     setShowCreateModal(true);
-  };
+  }, [lotes.length]);
 
-  // Handler para EJECUTAR la creación
   const executeCreateLote = async () => {
     if (!createName.trim()) return;
     
-    // Bloquear si no hay internet (para lotes es mejor forzar online por consistencia de IDs)
-    if (!isOnline) {
-        setAlertConfig({
-            isOpen: true,
-            type: 'alert',
-            title: 'Sin Conexión',
-            message: 'Para crear lotes nuevos necesitas conexión a internet.'
-        });
-        return;
+    // 1. GENERAR DATOS LOCALES INMEDIATAMENTE
+    const localId = safeUUID();
+    const now = new Date().toISOString();
+    const nuevoLote: Lote = {
+        id: localId,
+        nombre: createName,
+        fechaCreacion: now,
+        cerrado: false
+    };
+
+    // 2. ACTUALIZAR ESTADO VISUAL Y CACHÉ LOCAL (LOCAL FIRST)
+    const newLotesList = [nuevoLote, ...lotes];
+    setLotes(newLotesList);
+    OfflineStorage.guardarLotesCache(newLotesList); 
+    
+    // 3. CAMBIAR CONTEXTO
+    setActiveLoteId(localId); 
+    setActiveTab('lista');
+    setShowCreateModal(false);
+
+    // 4. GESTIÓN DE SINCRONIZACIÓN
+    OfflineStorage.agregarLoteCola(nuevoLote);
+
+    if (activeLote && !activeLote.cerrado && isOnline) {
+         SupabaseService.actualizarEstadoLote(activeLote.id, true);
     }
 
-    try {
-      if (activeLote && !activeLote.cerrado) {
-        await SupabaseService.actualizarEstadoLote(activeLote.id, true);
-      }
-
-      const nuevoLote = await SupabaseService.crearLote(createName);
-      if (nuevoLote) {
-        setActiveLoteId(nuevoLote.id);
-        setActiveTab('lista');
-      }
-      setShowCreateModal(false);
-    } catch (e) {
-      console.error(e);
-      setAlertConfig({
-        isOpen: true,
-        type: 'alert',
-        title: 'Error',
-        message: 'No se pudo crear el lote. Intenta de nuevo.'
-      });
+    // 5. INTENTAR SUBIR SI HAY INTERNET (BACKGROUND)
+    if (isOnline) {
+        try {
+            const result = await SupabaseService.crearLote(createName, localId);
+            if (result) {
+                OfflineStorage.removerLoteCola(localId);
+            }
+        } catch (e) {
+            console.warn("Fallo subida inmediata lote, se queda en cola offline", e);
+        }
     }
   };
 
   const handleToggleLoteStatus = (lote: Lote) => {
     if (!isOnline) {
-        setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Necesitas internet para modificar lotes.' });
+        setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Necesitas internet para modificar el estado de lotes.' });
         return;
     }
     const nuevoEstadoCerrado = !lote.cerrado;
     const accion = nuevoEstadoCerrado ? "CERRAR" : "REABRIR";
-    
     setAlertConfig({
-        isOpen: true,
-        type: 'confirm',
-        title: `${accion} Lote`,
+        isOpen: true, type: 'confirm', title: `${accion} Lote`,
         message: `¿Estás seguro de ${accion.toLowerCase()} el lote "${lote.nombre}"?`,
         confirmText: accion === "CERRAR" ? "Sí, Cerrar" : "Sí, Reabrir",
         isDestructive: accion === "CERRAR",
         onConfirm: async () => {
+           // Optimistic update locally
+           setLotes(prev => prev.map(l => l.id === lote.id ? { ...l, cerrado: nuevoEstadoCerrado } : l));
            await SupabaseService.actualizarEstadoLote(lote.id, nuevoEstadoCerrado);
-           if (!nuevoEstadoCerrado) {
-             setActiveLoteId(lote.id);
-             setActiveTab('lista');
-           }
+           // updateUI se maneja via realtime, pero como es mi propio cambio, optimismo es mejor
            setAlertConfig(prev => ({ ...prev, isOpen: false }));
         }
     });
@@ -322,31 +431,24 @@ const App: React.FC = () => {
          setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Necesitas internet para eliminar lotes.' });
          return;
     }
-
-    const lote = lotes.find(l => l.id === loteId);
-    if (!lote) return;
-
     setAlertConfig({
-        isOpen: true,
-        type: 'confirm',
-        title: 'Eliminar Lote Completo',
-        message: `Estás a punto de eliminar el "${lote.nombre}" y TODOS los aretes que contiene. Esta acción no se puede deshacer.`,
-        isDestructive: true,
-        confirmText: 'Sí, Eliminar Todo',
+        isOpen: true, type: 'confirm', title: 'Eliminar Lote',
+        message: 'Se eliminará el lote y todos sus aretes. ¿Continuar?',
+        isDestructive: true, confirmText: 'Sí, Eliminar',
         onConfirm: async () => {
             try {
-                setLotes(prev => prev.filter(l => l.id !== loteId));
+                // Optimistic delete
+                const newLotes = lotes.filter(l => l.id !== loteId);
+                setLotes(newLotes);
+                OfflineStorage.guardarLotesCache(newLotes); 
+                
                 if (activeLoteId === loteId) setActiveLoteId(null);
+                
                 await SupabaseService.eliminarLote(loteId);
                 setAlertConfig(prev => ({ ...prev, isOpen: false }));
             } catch (e) {
-                console.error(e);
-                setAlertConfig({
-                    isOpen: true,
-                    type: 'alert',
-                    title: 'Error',
-                    message: 'Hubo un problema al eliminar el lote. Intenta de nuevo.'
-                });
+                setAlertConfig({ isOpen: true, type: 'alert', title: 'Error', message: 'No se pudo eliminar el lote.' });
+                // Revert handled by full refresh if needed, or simple ignore
             }
         }
     });
@@ -358,144 +460,103 @@ const App: React.FC = () => {
   };
 
   // --- LÓGICA DE ESCANEO (OFFLINE FIRST) ---
-
   const handleScan = async (decodedText: string) => {
-    // 1. Validaciones previas
     if (!activeLoteId) {
-      setAlertConfig({
-        isOpen: true,
-        type: 'alert',
-        title: 'Sin Lote Activo',
-        message: 'Debes crear o seleccionar un lote antes de escanear.'
-      });
+      setAlertConfig({ isOpen: true, type: 'alert', title: 'Sin Lote Activo', message: 'Debes crear o seleccionar un lote antes de escanear.' });
       setActiveTab('lotes');
       return;
     }
 
     if (!isUnassignedView && activeLote?.cerrado) {
-       setAlertConfig({
-         isOpen: true,
-         type: 'alert',
-         title: 'Lote Cerrado',
-         message: `El lote "${activeLote.nombre}" está cerrado. Reábrelo para continuar.`
-       });
+       setAlertConfig({ isOpen: true, type: 'alert', title: 'Lote Cerrado', message: 'El lote actual está cerrado.' });
        setActiveTab('lotes');
        return;
     }
 
     const existeEnLote = aretesDelLote.find(a => a.codigo === decodedText);
     if (existeEnLote) {
-      setAlertConfig({
-         isOpen: true,
-         type: 'alert',
-         title: '⚠️ Duplicado',
-         message: `El arete ${decodedText} ya está en esta lista.`
-      });
+      setAlertConfig({ isOpen: true, type: 'alert', title: '⚠️ Duplicado', message: `El arete ${decodedText} ya está en esta lista.` });
       return;
     }
 
-    // 2. Iniciar proceso de guardado (Bloqueo UI breve)
-    setIsProcessingScan(true);
-    if (navigator.vibrate) navigator.vibrate(200);
+    try {
+        setIsProcessingScan(true);
+        if (navigator.vibrate) navigator.vibrate(200);
 
-    // 3. Crear objeto local para actualización optimista
-    const tempId = crypto.randomUUID();
-    const newArete: Arete = {
-        id: tempId,
-        codigo: decodedText,
-        fechaEscaneo: new Date().toISOString(),
-        estado: EstadoArete.PENDIENTE,
-        loteId: activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId,
-        sincronizado: false 
-    };
+        const tempId = safeUUID();
+        const newArete: Arete = {
+            id: tempId,
+            codigo: decodedText,
+            fechaEscaneo: new Date().toISOString(),
+            estado: EstadoArete.PENDIENTE,
+            loteId: activeLoteId === UNASSIGNED_LOTE_ID ? undefined : activeLoteId,
+            sincronizado: false 
+        };
 
-    // 4. Guardar en cola Offline SIEMPRE (seguridad primero)
-    OfflineStorage.agregarACola(newArete);
+        // 1. GUARDADO LOCAL INMEDIATO
+        OfflineStorage.agregarACola(newArete);
+        const updatedAretes = [newArete, ...aretes];
+        setAretes(updatedAretes);
 
-    // 5. Actualizar UI inmediatamente
-    setAretes(prev => [newArete, ...prev]);
-
-    // 6. Intentar sincronizar si hay internet
-    if (isOnline) {
-        try {
-            // Intentar subir inmediatamente
-            await SupabaseService.guardarArete(decodedText, newArete.loteId);
-            // Si éxito, quitar de la cola local
-            OfflineStorage.removerDeCola(tempId);
-            // Actualizar estado local a sincronizado
-            setAretes(prev => prev.map(a => a.id === tempId ? { ...a, sincronizado: true } : a));
-        } catch (error) {
-            console.error("Fallo subida inmediata, se queda en cola", error);
-            // No pasa nada, ya está en la cola y en la UI como pendiente
+        // 2. INTENTO DE SUBIDA (Background)
+        if (isOnline) {
+             SupabaseService.guardarArete(decodedText, newArete.loteId)
+                .then(() => {
+                    OfflineStorage.removerDeCola(tempId);
+                    // Actualizar estado a sincronizado sin recargar todo
+                    setAretes(prev => prev.map(a => a.id === tempId ? { ...a, sincronizado: true } : a));
+                })
+                .catch(err => console.error("Sync background falló, queda en cola", err));
         }
-    }
 
-    setTimeout(() => {
+        setTimeout(() => {
+            setIsProcessingScan(false);
+            setActiveTab('lista');
+        }, 600);
+
+    } catch (e) {
+        console.error("Error handleScan", e);
         setIsProcessingScan(false);
-        setActiveTab('lista');
-    }, 600); 
+    }
   };
 
-  // --- GESTIÓN DE ARETES ---
-
-  const handleUpdateStatus = async (id: string, status: EstadoArete) => {
-    // Optimista
+  const handleUpdateStatus = useCallback(async (id: string, status: EstadoArete) => {
+    // Optimistic
     setAretes(prev => prev.map(a => a.id === id ? { ...a, estado: status } : a));
-    
-    // Si es offline, deberíamos actualizar en la cola offline también?
-    // Por ahora, asumimos que cambios de estado requieren internet para impactar DB real.
     if (isOnline) {
         await SupabaseService.actualizarEstado(id, status);
-    } else {
-        // TODO: Implementar cola de actualizaciones. 
-        // Por ahora alertar.
-        // setAlertConfig({ isOpen: true, type: 'alert', title: 'Offline', message: 'Cambio guardado localmente (visual). Se perderá si recargas.' });
-        // Simplemente no hacemos el await.
     }
-  };
+  }, [isOnline]);
 
-  const handleDelete = (id: string) => {
+  const handleDelete = useCallback((id: string) => {
     setAlertConfig({
-        isOpen: true,
-        type: 'confirm',
-        title: '¿Eliminar arete?',
-        message: 'Esta acción eliminará el registro. ¿Continuar?',
-        isDestructive: true,
-        confirmText: 'Eliminar',
+        isOpen: true, type: 'confirm', title: '¿Eliminar arete?',
+        message: 'Esta acción eliminará el registro.', isDestructive: true, confirmText: 'Eliminar',
         onConfirm: async () => {
-            // Eliminar de UI
             setAretes(prev => prev.filter(a => a.id !== id));
-            // Eliminar de cola offline si existe
             OfflineStorage.removerDeCola(id);
-            // Eliminar de servidor si hay red
-            if (isOnline) {
-                await SupabaseService.eliminarArete(id);
-            }
+            if (isOnline) await SupabaseService.eliminarArete(id);
             setAlertConfig(prev => ({ ...prev, isOpen: false }));
         }
     });
-  };
+  }, [isOnline]);
 
-  const filteredAretes = aretesDelLote.filter(a => 
-    a.codigo.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const filteredAretes = useMemo(() => {
+      return aretesDelLote.filter(a => a.codigo.toLowerCase().includes(searchTerm.toLowerCase()));
+  }, [aretesDelLote, searchTerm]);
 
-  const aretesSinLoteCount = aretes.filter(a => !a.loteId).length;
+  const aretesSinLoteCount = useMemo(() => aretes.filter(a => !a.loteId).length, [aretes]);
 
   // --- REPORTE ---
   const reportePorFecha = useMemo(() => {
     const grupos: Record<string, Arete[]> = {};
     aretes.forEach(arete => {
-      const fecha = new Date(arete.fechaEscaneo).toLocaleDateString('es-MX', { 
-        year: 'numeric', month: 'long', day: 'numeric' 
-      });
+      const fecha = new Date(arete.fechaEscaneo).toLocaleDateString('es-MX', { year: 'numeric', month: 'long', day: 'numeric' });
       if (!grupos[fecha]) grupos[fecha] = [];
       grupos[fecha].push(arete);
     });
     return Object.entries(grupos).sort((a, b) => {
-      if (b[1].length > 0 && a[1].length > 0) {
-        return new Date(b[1][0].fechaEscaneo).getTime() - new Date(a[1][0].fechaEscaneo).getTime();
-      }
+      if (b[1].length > 0 && a[1].length > 0) return new Date(b[1][0].fechaEscaneo).getTime() - new Date(a[1][0].fechaEscaneo).getTime();
       return 0;
     });
   }, [aretes]);
@@ -516,16 +577,16 @@ const App: React.FC = () => {
                          <span className="flex items-center gap-1 text-[10px] text-amber-300 font-bold animate-pulse">
                             <CloudUpload size={10} /> Sincronizando...
                          </span>
+                    ) : isDownloading ? (
+                        <span className="flex items-center gap-1 text-[10px] text-emerald-200 font-bold animate-pulse">
+                            <CloudDownload size={10} /> Descargando...
+                        </span>
                     ) : !isOnline ? (
                         <span className="flex items-center gap-1 text-[10px] text-slate-300 font-bold">
                              <WifiOff size={10} /> Modo Offline
                         </span>
                     ) : connectionStatus === 'CONNECTED' ? (
                         <span className="flex items-center gap-1 text-[10px] text-emerald-200 font-medium">
-                            <span className="relative flex h-2 w-2">
-                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
-                            </span>
                             En Línea
                         </span>
                     ) : (
@@ -558,7 +619,6 @@ const App: React.FC = () => {
           <div className="flex flex-col items-center justify-center h-full space-y-6">
             <h2 className="text-xl font-semibold text-slate-800">Escáner de Aretes</h2>
             
-            {/* Overlay de Procesamiento */}
             {isProcessingScan && (
                 <div className="absolute inset-0 z-50 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
                     <Loader2 className="w-12 h-12 text-emerald-600 animate-spin mb-4" />
@@ -594,7 +654,6 @@ const App: React.FC = () => {
                                 Guardando en: {isUnassignedView ? 'Sin Lote Asignado' : activeLote?.nombre}
                             </span>
                         </div>
-                        {/* Pasamos el estado al scanner para que sepa cuándo detenerse */}
                         <Scanner onScanSuccess={handleScan} isScanning={activeTab === 'escanear' && !isProcessingScan} />
                     </div>
                     <p className="text-sm text-slate-500 text-center max-w-xs">
@@ -605,41 +664,25 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {/* VIEW: LISTA Y LOTES (Unified View) */}
+        {/* VIEW: LISTA Y LOTES */}
         {(activeTab === 'lista' || activeTab === 'lotes') && (
             <div className="space-y-4">
-                
-                {/* Unified Toggle / Switcher */}
                 <div className="bg-white p-1 rounded-xl shadow-sm border border-slate-200 flex mb-4">
-                    <button 
-                        onClick={() => setActiveTab('lista')}
-                        className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all
-                            ${activeTab === 'lista' ? 'bg-emerald-100 text-emerald-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
-                    >
+                    <button onClick={() => setActiveTab('lista')} className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all ${activeTab === 'lista' ? 'bg-emerald-100 text-emerald-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}>
                         <FileText size={16} /> Lista Actual
                     </button>
-                    <button 
-                        onClick={() => setActiveTab('lotes')}
-                        className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all
-                            ${activeTab === 'lotes' ? 'bg-blue-100 text-blue-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}
-                    >
+                    <button onClick={() => setActiveTab('lotes')} className={`flex-1 py-2 text-sm font-bold rounded-lg flex items-center justify-center gap-2 transition-all ${activeTab === 'lotes' ? 'bg-blue-100 text-blue-800 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}>
                         <Folder size={16} /> Historial Lotes
                     </button>
                 </div>
 
-                {/* --- SUB-VIEW: LISTA --- */}
                 {activeTab === 'lista' && (
                     <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
                         <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 mb-4">
                             {!activeLoteId ? (
                                 <div className="text-center py-4">
                                     <p className="text-slate-500 mb-3">No hay un lote seleccionado.</p>
-                                    <button 
-                                        onClick={handleCreateLote}
-                                        className="bg-emerald-600 text-white px-6 py-2 rounded-lg font-medium shadow-lg hover:scale-105 transition-transform"
-                                    >
-                                        Crear Primer Lote
-                                    </button>
+                                    <button onClick={handleCreateLote} className="bg-emerald-600 text-white px-6 py-2 rounded-lg font-medium shadow-lg hover:scale-105 transition-transform">Crear Primer Lote</button>
                                 </div>
                             ) : (
                                 <div>
@@ -650,38 +693,19 @@ const App: React.FC = () => {
                                                 {!isUnassignedView && activeLote?.cerrado && <Lock size={16} className="text-red-500" />}
                                             </h2>
                                             <p className="text-xs text-slate-500">
-                                                {isUnassignedView 
-                                                    ? "Registros antiguos o sin asignar" 
-                                                    : (activeLote ? `Creado: ${new Date(activeLote.fechaCreacion).toLocaleString('es-MX')}` : 'Seleccione otro lote')
-                                                }
+                                                {isUnassignedView ? "Registros antiguos o sin asignar" : (activeLote ? `Creado: ${new Date(activeLote.fechaCreacion).toLocaleString('es-MX')}` : 'Seleccione otro lote')}
                                             </p>
                                         </div>
-                                        
                                         {!isUnassignedView && activeLote && (
-                                            <button 
-                                                onClick={() => handleToggleLoteStatus(activeLote)}
-                                                className={`px-3 py-1.5 rounded-lg text-xs font-bold border flex items-center gap-1 transition-colors
-                                                    ${activeLote.cerrado 
-                                                        ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' 
-                                                        : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'
-                                                    }`}
-                                            >
-                                                {activeLote.cerrado ? <Unlock size={14} /> : <Lock size={14} />}
-                                                {activeLote.cerrado ? "REABRIR" : "CERRAR"}
+                                            <button onClick={() => handleToggleLoteStatus(activeLote)} className={`px-3 py-1.5 rounded-lg text-xs font-bold border flex items-center gap-1 transition-colors ${activeLote.cerrado ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'}`}>
+                                                {activeLote.cerrado ? <Unlock size={14} /> : <Lock size={14} />} {activeLote.cerrado ? "REABRIR" : "CERRAR"}
                                             </button>
                                         )}
                                     </div>
-
                                     <div className="flex gap-2">
                                         <div className="relative flex-1">
                                             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                                            <input 
-                                            type="text" 
-                                            placeholder="Buscar arete..." 
-                                            className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                                            value={searchTerm}
-                                            onChange={(e) => setSearchTerm(e.target.value)}
-                                            />
+                                            <input type="text" placeholder="Buscar arete..." className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
                                         </div>
                                         <ExportButton aretes={filteredAretes} />
                                     </div>
@@ -691,25 +715,16 @@ const App: React.FC = () => {
 
                         {activeLoteId && (
                             <>
-                                {/* Siempre mostrar Stats (que contiene la imagen del toro) */}
                                 <Stats aretes={aretesDelLote} />
-
                                 <div className="space-y-3">
                                 {!isLoadingData && filteredAretes.length === 0 ? (
                                     <div className="text-center py-8 text-slate-400">
-                                        <div className="inline-block p-3 bg-slate-100 rounded-full mb-2">
-                                            <List size={24} className="opacity-40" />
-                                        </div>
+                                        <div className="inline-block p-3 bg-slate-100 rounded-full mb-2"><List size={24} className="opacity-40" /></div>
                                         <p className="text-sm">Lista vacía. Usa el botón central para escanear.</p>
                                     </div>
                                 ) : (
                                     filteredAretes.map(arete => (
-                                    <TagItem 
-                                        key={arete.id} 
-                                        arete={arete} 
-                                        onUpdateStatus={handleUpdateStatus} 
-                                        onDelete={handleDelete}
-                                    />
+                                    <TagItem key={arete.id} arete={arete} onUpdateStatus={handleUpdateStatus} onDelete={handleDelete} />
                                     ))
                                 )}
                                 </div>
@@ -718,61 +733,53 @@ const App: React.FC = () => {
                     </div>
                 )}
 
-                {/* --- SUB-VIEW: LOTES (HISTORIAL) --- */}
                 {activeTab === 'lotes' && (
                     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
-                        <button 
-                            onClick={handleCreateLote}
-                            className="w-full bg-white border-2 border-dashed border-emerald-300 hover:border-emerald-500 hover:bg-emerald-50 text-emerald-700 p-4 rounded-xl flex items-center justify-center gap-2 font-bold transition-all group"
+                        {/* BOTÓN NUEVO: DESCARGA OFFLINE */}
+                         <button 
+                            onClick={handleDownloadOfflineData} 
+                            disabled={isDownloading || !isOnline}
+                            className={`w-full p-4 rounded-xl flex items-center justify-center gap-2 font-bold transition-all shadow-sm
+                                ${isDownloading 
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200 cursor-wait' 
+                                    : !isOnline 
+                                        ? 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
+                                        : 'bg-indigo-600 text-white hover:bg-indigo-700 border-indigo-700 shadow-indigo-200'
+                                }`
+                            }
                         >
-                            <FolderPlus className="group-hover:scale-110 transition-transform" />
-                            Crear Nuevo Lote
+                            {isDownloading ? (
+                                <><Loader2 className="animate-spin" /> Descargando Datos...</>
+                            ) : (
+                                <><CloudDownload /> Descargar para Offline</>
+                            )}
+                        </button>
+                        
+                        <button onClick={handleCreateLote} className="w-full bg-white border-2 border-dashed border-emerald-300 hover:border-emerald-500 hover:bg-emerald-50 text-emerald-700 p-4 rounded-xl flex items-center justify-center gap-2 font-bold transition-all group">
+                            <FolderPlus className="group-hover:scale-110 transition-transform" /> Crear Nuevo Lote
                         </button>
 
                         {aretesSinLoteCount > 0 && (
-                            <div 
-                            onClick={() => handleActivateLote(UNASSIGNED_LOTE_ID)}
-                            className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-center justify-between group
-                                ${activeLoteId === UNASSIGNED_LOTE_ID 
-                                ? 'bg-amber-50 border-amber-500 shadow-md' 
-                                : 'bg-white border-slate-100 hover:border-amber-200 hover:shadow-sm'
-                                }
-                            `}
-                            >
-                            <div className="flex items-start gap-3">
-                                <div className={`p-2 rounded-lg ${activeLoteId === UNASSIGNED_LOTE_ID ? 'bg-amber-200 text-amber-800' : 'bg-slate-100 text-slate-500'}`}>
-                                <Archive size={20} />
+                            <div onClick={() => handleActivateLote(UNASSIGNED_LOTE_ID)} className={`p-4 rounded-xl border-2 transition-all cursor-pointer flex items-center justify-between group ${activeLoteId === UNASSIGNED_LOTE_ID ? 'bg-amber-50 border-amber-500 shadow-md' : 'bg-white border-slate-100 hover:border-amber-200 hover:shadow-sm'}`}>
+                                <div className="flex items-start gap-3">
+                                    <div className={`p-2 rounded-lg ${activeLoteId === UNASSIGNED_LOTE_ID ? 'bg-amber-200 text-amber-800' : 'bg-slate-100 text-slate-500'}`}><Archive size={20} /></div>
+                                    <div>
+                                        <h4 className={`font-bold ${activeLoteId === UNASSIGNED_LOTE_ID ? 'text-amber-900' : 'text-slate-700'}`}>Sin Lote / Antiguos</h4>
+                                        <div className="mt-1">
+                                            <span className="text-xs font-semibold bg-slate-100 px-2 py-0.5 rounded text-slate-600">{aretesSinLoteCount} registros</span>
+                                            {activeLoteId === UNASSIGNED_LOTE_ID && <span className="ml-2 text-xs font-bold text-amber-600">● VIENDO</span>}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div>
-                                <h4 className={`font-bold ${activeLoteId === UNASSIGNED_LOTE_ID ? 'text-amber-900' : 'text-slate-700'}`}>
-                                    Sin Lote / Antiguos
-                                </h4>
-                                <div className="mt-1">
-                                    <span className="text-xs font-semibold bg-slate-100 px-2 py-0.5 rounded text-slate-600">
-                                    {aretesSinLoteCount} registros
-                                    </span>
-                                    {activeLoteId === UNASSIGNED_LOTE_ID && <span className="ml-2 text-xs font-bold text-amber-600">● VIENDO</span>}
-                                </div>
-                                </div>
-                            </div>
                             </div>
                         )}
 
                         {lotes.length === 0 && aretesSinLoteCount === 0 ? (
-                            <div className="text-center py-12">
-                                <p className="text-slate-400">No hay historial de lotes.</p>
-                            </div>
+                            <div className="text-center py-12"><p className="text-slate-400">No hay historial de lotes.</p></div>
                         ) : (
                             <div className="space-y-3">
                                 {lotes.map(lote => (
-                                    <LotItem 
-                                        key={lote.id} 
-                                        lote={lote} 
-                                        isActive={activeLoteId === lote.id}
-                                        totalAretes={aretes.filter(a => a.loteId === lote.id).length}
-                                        onActivate={() => handleActivateLote(lote.id)}
-                                        onDelete={handleDeleteLote}
-                                    />
+                                    <LotItem key={lote.id} lote={lote} isActive={activeLoteId === lote.id} totalAretes={aretes.filter(a => a.loteId === lote.id).length} onActivate={() => handleActivateLote(lote.id)} onDelete={handleDeleteLote} />
                                 ))}
                             </div>
                         )}
@@ -781,20 +788,13 @@ const App: React.FC = () => {
             </div>
         )}
 
-        {/* VIEW: REPORT */}
         {activeTab === 'analisis' && (
           <div className="space-y-6">
             <div className="bg-white p-6 rounded-2xl shadow-lg border border-slate-100">
               <div className="flex items-center gap-3 mb-6 border-b pb-4 border-slate-100">
-                <div className="bg-violet-100 p-2 rounded-lg">
-                  <CalendarRange size={24} className="text-violet-600" />
-                </div>
-                <div>
-                    <h2 className="text-xl font-bold text-slate-800">Reporte Global</h2>
-                    <p className="text-xs text-slate-500">Histórico de todos los lotes</p>
-                </div>
+                <div className="bg-violet-100 p-2 rounded-lg"><CalendarRange size={24} className="text-violet-600" /></div>
+                <div><h2 className="text-xl font-bold text-slate-800">Reporte Global</h2><p className="text-xs text-slate-500">Histórico de todos los lotes</p></div>
               </div>
-
               {reportePorFecha.length === 0 ? (
                 <p className="text-center text-slate-400 py-8">No hay datos para mostrar.</p>
               ) : (
@@ -804,32 +804,17 @@ const App: React.FC = () => {
                     const pendientes = items.filter(i => i.estado === EstadoArete.PENDIENTE).length;
                     const bajas = items.filter(i => i.estado === EstadoArete.BAJA).length;
                     const noReg = items.filter(i => i.estado === EstadoArete.NO_REGISTRADO).length;
-
                     return (
                       <div key={fecha} className="border border-slate-200 rounded-xl overflow-hidden">
                         <div className="bg-slate-50 p-3 flex justify-between items-center border-b border-slate-200">
                            <h3 className="font-bold text-slate-700 capitalize">{fecha}</h3>
-                           <span className="bg-white px-2 py-1 rounded text-xs font-bold text-slate-600 border shadow-sm">
-                             {items.length} Total
-                           </span>
+                           <span className="bg-white px-2 py-1 rounded text-xs font-bold text-slate-600 border shadow-sm">{items.length} Total</span>
                         </div>
                         <div className="p-4 grid grid-cols-2 gap-4 text-sm">
-                           <div className="flex items-center gap-2 text-green-700">
-                              <CheckCircle2 size={16} />
-                              <span>{confirmados} Altas</span>
-                           </div>
-                           <div className="flex items-center gap-2 text-slate-500">
-                              <div className="w-4 h-4 rounded-full border-2 border-slate-300"></div>
-                              <span>{pendientes} Pendientes</span>
-                           </div>
-                           <div className="flex items-center gap-2 text-red-600">
-                              <XCircle size={16} />
-                              <span>{noReg} No Reg.</span>
-                           </div>
-                           <div className="flex items-center gap-2 text-yellow-600">
-                              <AlertTriangle size={16} />
-                              <span>{bajas} Bajas</span>
-                           </div>
+                           <div className="flex items-center gap-2 text-green-700"><CheckCircle2 size={16} /><span>{confirmados} Altas</span></div>
+                           <div className="flex items-center gap-2 text-slate-500"><div className="w-4 h-4 rounded-full border-2 border-slate-300"></div><span>{pendientes} Pendientes</span></div>
+                           <div className="flex items-center gap-2 text-red-600"><XCircle size={16} /><span>{noReg} No Reg.</span></div>
+                           <div className="flex items-center gap-2 text-yellow-600"><AlertTriangle size={16} /><span>{bajas} Bajas</span></div>
                         </div>
                       </div>
                     );
@@ -841,54 +826,28 @@ const App: React.FC = () => {
         )}
       </main>
 
-      {/* --- MODALES PERSONALIZADOS --- */}
+      {/* --- MODALES --- */}
       {showCreateModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden scale-100 animate-in zoom-in-95 duration-200">
                 <div className="bg-emerald-600 p-4 flex justify-between items-center text-white">
-                    <h3 className="font-bold text-lg flex items-center gap-2">
-                        <FolderPlus size={20} /> Nuevo Lote
-                    </h3>
-                    <button onClick={() => setShowCreateModal(false)} className="hover:bg-emerald-700 p-1 rounded-full transition-colors">
-                        <X size={20} />
-                    </button>
+                    <h3 className="font-bold text-lg flex items-center gap-2"><FolderPlus size={20} /> Nuevo Lote</h3>
+                    <button onClick={() => setShowCreateModal(false)} className="hover:bg-emerald-700 p-1 rounded-full transition-colors"><X size={20} /></button>
                 </div>
-                
                 <div className="p-6">
                     <div className="mb-4">
                         <label className="block text-sm font-medium text-slate-700 mb-1">Nombre del Lote</label>
-                        <input 
-                            type="text" 
-                            value={createName}
-                            onChange={(e) => setCreateName(e.target.value)}
-                            className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none font-medium"
-                            placeholder="Ej. Lote 12 Octubre"
-                            autoFocus
-                        />
+                        <input type="text" value={createName} onChange={(e) => setCreateName(e.target.value)} className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none font-medium" placeholder="Ej. Lote 12 Octubre" autoFocus />
                     </div>
-
                     {activeLote && !activeLote.cerrado && (
                         <div className="mb-6 bg-amber-50 border border-amber-200 rounded-lg p-3 flex gap-3 items-start">
                             <AlertTriangle className="text-amber-500 shrink-0 mt-0.5" size={18} />
-                            <div className="text-xs text-amber-800">
-                                <span className="font-bold">Nota:</span> El lote actual <strong>"{activeLote.nombre}"</strong> se cerrará automáticamente.
-                            </div>
+                            <div className="text-xs text-amber-800"><span className="font-bold">Nota:</span> El lote actual <strong>"{activeLote.nombre}"</strong> se cerrará automáticamente (si hay internet).</div>
                         </div>
                     )}
-
                     <div className="flex gap-3">
-                        <button 
-                            onClick={() => setShowCreateModal(false)}
-                            className="flex-1 py-2.5 text-slate-600 font-bold hover:bg-slate-50 rounded-lg transition-colors border border-transparent hover:border-slate-200"
-                        >
-                            Cancelar
-                        </button>
-                        <button 
-                            onClick={executeCreateLote}
-                            className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg shadow-lg shadow-emerald-200 transition-all"
-                        >
-                            Crear Lote
-                        </button>
+                        <button onClick={() => setShowCreateModal(false)} className="flex-1 py-2.5 text-slate-600 font-bold hover:bg-slate-50 rounded-lg transition-colors border border-transparent hover:border-slate-200">Cancelar</button>
+                        <button onClick={executeCreateLote} className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg shadow-lg shadow-emerald-200 transition-all">Crear Lote</button>
                     </div>
                 </div>
             </div>
@@ -899,86 +858,32 @@ const App: React.FC = () => {
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden scale-100 animate-in zoom-in-95 duration-200">
                 <div className={`p-4 flex items-center gap-3 border-b ${alertConfig.isDestructive ? 'bg-red-50 border-red-100' : 'bg-white border-slate-100'}`}>
-                    {alertConfig.isDestructive || alertConfig.type === 'alert' ? (
-                         <AlertTriangle className={alertConfig.isDestructive ? "text-red-500" : "text-amber-500"} size={24} />
-                    ) : (
-                         <CheckCircle2 className="text-emerald-500" size={24} />
-                    )}
-                    <h3 className={`font-bold text-lg ${alertConfig.isDestructive ? 'text-red-800' : 'text-slate-800'}`}>
-                        {alertConfig.title}
-                    </h3>
+                    {alertConfig.isDestructive || alertConfig.type === 'alert' ? <AlertTriangle className={alertConfig.isDestructive ? "text-red-500" : "text-amber-500"} size={24} /> : <CheckCircle2 className="text-emerald-500" size={24} />}
+                    <h3 className={`font-bold text-lg ${alertConfig.isDestructive ? 'text-red-800' : 'text-slate-800'}`}>{alertConfig.title}</h3>
                 </div>
                 <div className="p-6">
-                    <p className="text-slate-600 mb-6 leading-relaxed">
-                        {alertConfig.message}
-                    </p>
+                    <p className="text-slate-600 mb-6 leading-relaxed">{alertConfig.message}</p>
                     <div className="flex gap-3 justify-end">
-                        {alertConfig.type === 'confirm' && (
-                            <button 
-                                onClick={() => setAlertConfig(prev => ({...prev, isOpen: false}))}
-                                className="px-4 py-2 text-slate-500 font-bold hover:bg-slate-50 rounded-lg transition-colors"
-                            >
-                                Cancelar
-                            </button>
-                        )}
-                        <button 
-                            onClick={() => {
-                                if (alertConfig.onConfirm) alertConfig.onConfirm();
-                                else setAlertConfig(prev => ({...prev, isOpen: false}));
-                            }}
-                            className={`px-6 py-2 text-white font-bold rounded-lg shadow-md transition-all
-                                ${alertConfig.isDestructive 
-                                    ? 'bg-red-600 hover:bg-red-700 shadow-red-200' 
-                                    : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'
-                                }`}
-                        >
-                            {alertConfig.confirmText || "Aceptar"}
-                        </button>
+                        {alertConfig.type === 'confirm' && <button onClick={() => setAlertConfig(prev => ({...prev, isOpen: false}))} className="px-4 py-2 text-slate-500 font-bold hover:bg-slate-50 rounded-lg transition-colors">Cancelar</button>}
+                        <button onClick={() => { if (alertConfig.onConfirm) alertConfig.onConfirm(); else setAlertConfig(prev => ({...prev, isOpen: false})); }} className={`px-6 py-2 text-white font-bold rounded-lg shadow-md transition-all ${alertConfig.isDestructive ? 'bg-red-600 hover:bg-red-700 shadow-red-200' : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'}`}>{alertConfig.confirmText || "Aceptar"}</button>
                     </div>
                 </div>
             </div>
         </div>
       )}
 
-      {/* Bottom Navigation Refactored */}
+      {/* Navigation */}
       <nav className="fixed bottom-0 w-full max-w-2xl bg-white border-t border-slate-200 p-2 pb-safe flex justify-between items-end shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] z-50">
-        
-        {/* BOTÓN IZQUIERDO: Registros (Lista + Lotes) */}
-        <button 
-          onClick={() => setActiveTab('lista')}
-          className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all 
-            ${(activeTab === 'lista' || activeTab === 'lotes') ? 'text-emerald-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}
-        >
-          <List size={26} strokeWidth={activeTab === 'lista' || activeTab === 'lotes' ? 2.5 : 2} />
-          <span className="text-[11px] font-medium mt-1">Registros</span>
-        </button>
-        
-        {/* BOTÓN CENTRAL: Escanear (Flotante) */}
+        <button onClick={() => setActiveTab('lista')} className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all ${(activeTab === 'lista' || activeTab === 'lotes') ? 'text-emerald-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}><List size={26} strokeWidth={(activeTab === 'lista' || activeTab === 'lotes') ? 2.5 : 2} /><span className="text-[11px] font-medium mt-1">Registros</span></button>
         <div className="relative -top-6 px-2">
-            <button 
-            onClick={() => setActiveTab('escanear')}
-            className={`flex flex-col items-center justify-center bg-emerald-600 text-white rounded-full w-16 h-16 shadow-xl border-4 border-slate-50 hover:bg-emerald-700 hover:scale-105 transition-all
-                ${activeTab === 'escanear' ? 'ring-4 ring-emerald-200' : ''}`}
-            >
-            <ScanLine size={30} />
-            </button>
+            <button onClick={() => setActiveTab('escanear')} className={`flex flex-col items-center justify-center bg-emerald-600 text-white rounded-full w-16 h-16 shadow-xl border-4 border-slate-50 hover:bg-emerald-700 hover:scale-105 transition-all ${activeTab === 'escanear' ? 'ring-4 ring-emerald-200' : ''}`}><ScanLine size={30} /></button>
         </div>
-
-        {/* BOTÓN DERECHO: Reportes */}
-        <button 
-          onClick={() => setActiveTab('analisis')}
-          className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all 
-            ${activeTab === 'analisis' ? 'text-violet-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}
-        >
-          <CalendarRange size={26} strokeWidth={activeTab === 'analisis' ? 2.5 : 2} />
-          <span className="text-[11px] font-medium mt-1">Reporte</span>
-        </button>
+        <button onClick={() => setActiveTab('analisis')} className={`flex-1 flex flex-col items-center p-2 rounded-lg transition-all ${activeTab === 'analisis' ? 'text-violet-700 font-bold' : 'text-slate-400 hover:text-slate-600'}`}><CalendarRange size={26} strokeWidth={activeTab === 'analisis' ? 2.5 : 2} /><span className="text-[11px] font-medium mt-1">Reporte</span></button>
       </nav>
     </div>
   );
 };
 
-// Root rendering logic
 const container = document.getElementById('root');
 if (container) {
   const root = createRoot(container);

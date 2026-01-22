@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { memo } from 'react';
 import { Arete, EstadoArete } from '../types';
-import { Check, X, AlertTriangle, Trash2, Calendar, Hash, CloudUpload, CloudCheck } from 'lucide-react';
+import { Check, X, AlertTriangle, Trash2, Calendar, CloudUpload, CloudCheck } from 'lucide-react';
 
 interface TagItemProps {
   arete: Arete;
@@ -25,10 +25,9 @@ const TagItem: React.FC<TagItemProps> = ({ arete, onUpdateStatus, onDelete }) =>
       <div className="absolute top-2 right-2">
          {arete.sincronizado === false ? (
              <span className="flex items-center gap-1 text-[10px] font-bold text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-200 animate-pulse">
-                <CloudUpload size={12} /> Pendiente Subir
+                <CloudUpload size={12} /> Pendiente
              </span>
          ) : (
-            // Opcional: Mostrar check de nube si está sincronizado, o nada para limpiar la UI
             <span className="text-slate-300">
                <CloudCheck size={14} />
             </span>
@@ -93,4 +92,12 @@ const TagItem: React.FC<TagItemProps> = ({ arete, onUpdateStatus, onDelete }) =>
   );
 };
 
-export default TagItem;
+// Optimization: Only re-render if props change significantly
+export default memo(TagItem, (prev, next) => {
+    return (
+        prev.arete.id === next.arete.id &&
+        prev.arete.estado === next.arete.estado &&
+        prev.arete.sincronizado === next.arete.sincronizado &&
+        prev.arete.codigo === next.arete.codigo
+    );
+});
