@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { CameraOff, Loader2 } from 'lucide-react';
 
 interface ScannerProps {
   onScanSuccess: (decodedText: string) => void;
@@ -6,158 +7,81 @@ interface ScannerProps {
 }
 
 const Scanner: React.FC<ScannerProps> = ({ onScanSuccess, isScanning }) => {
+  const [errorMessage, setErrorMessage] = useState<string>('');
   const scannerRef = useRef<any>(null);
-  const [error, setError] = useState<string>('');
-  const [permissionGranted, setPermissionGranted] = useState(false);
-  
-  // Ref to track if component is mounted to prevent state updates on unmount
-  const isMountedRef = useRef(true);
-  // Ref to prevent double scanning
-  const isProcessingRef = useRef(false);
 
   useEffect(() => {
-    isMountedRef.current = true;
-    isProcessingRef.current = false;
-
-    // @ts-ignore
-    if (!window.Html5Qrcode) {
-      setError("Librería de escáner no cargada.");
-      return;
-    }
-
-    const elementId = "reader";
-    // @ts-ignore
-    const html5QrCode = new window.Html5Qrcode(elementId);
-    scannerRef.current = html5QrCode;
-
-    const config = { 
-        fps: 10, 
-        qrbox: { width: 250, height: 250 },
-        aspectRatio: 1.0,
-        disableFlip: false 
+    // Limpieza al desmontar el componente
+    return () => {
+      if (scannerRef.current) {
+        try {
+          scannerRef.current.clear().catch(() => {});
+        } catch (e) {
+          console.warn(e);
+        }
+      }
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isScanning) return;
 
     const startScanner = async () => {
+      const elementId = "reader";
+      
+      // @ts-ignore
+      if (!window.Html5Qrcode) {
+        setErrorMessage("Librería no cargada");
+        return;
+      }
+
       try {
+        // Instancia simple y directa
         // @ts-ignore
-        const devices = await window.Html5Qrcode.getCameras();
-        
-        if (!devices || devices.length === 0) {
-            throw new Error("No se detectaron cámaras.");
-        }
-
-        // Prefer back camera
-        let cameraId = devices[0].id;
-        const backCamera = devices.find((device: any) => 
-            device.label.toLowerCase().includes('back') || 
-            device.label.toLowerCase().includes('trasera') ||
-            device.label.toLowerCase().includes('environment')
-        );
-        
-        if (backCamera) {
-            cameraId = backCamera.id;
-        }
-
-        if (!isMountedRef.current) return;
+        const html5QrCode = new window.Html5Qrcode(elementId);
+        scannerRef.current = html5QrCode;
 
         await html5QrCode.start(
-          cameraId, 
-          config, 
+          { facingMode: "environment" }, // Cámara trasera estándar
+          {
+            fps: 10,
+            qrbox: { width: 250, height: 250 },
+            aspectRatio: 1.0
+          },
           (decodedText: string) => {
-              if (isProcessingRef.current) return;
-              isProcessingRef.current = true;
-
-              // Play sound
-              const audio = new Audio('https://codeskulptor-demos.commondatastorage.googleapis.com/pang/pop.mp3');
-              audio.play().catch(() => {});
-              
-              // Pause scanner visually
-              try {
-                 html5QrCode.pause(true);
-              } catch (e) {}
-
-              onScanSuccess(decodedText);
+            // Éxito
+            html5QrCode.pause(true);
+            const audio = new Audio('https://codeskulptor-demos.commondatastorage.googleapis.com/pang/pop.mp3');
+            audio.play().catch(() => {});
+            onScanSuccess(decodedText);
           },
           (errorMessage: string) => {
-              // Ignore parse errors
+            // Silencio absoluto en errores de frame para evitar saturación
           }
         );
-        
-        if (isMountedRef.current) {
-            setPermissionGranted(true);
-            setError("");
-        }
-        
-      } catch (err: any) {
-        console.error("Error scanner:", err);
-        if (isMountedRef.current) {
-            let msg = "Error al iniciar cámara.";
-            if (err?.name === "NotAllowedError") msg = "Permiso denegado.";
-            if (err?.name === "NotFoundError") msg = "Cámara no encontrada.";
-            setError(msg);
-        }
+      } catch (err) {
+        console.warn(err);
+        setErrorMessage("No se pudo acceder a la cámara.");
       }
     };
 
-    if (isScanning) {
-        // Small delay to ensure DOM is ready and previous instance is cleared
-        setTimeout(() => {
-            startScanner();
-        }, 300);
-    }
-
-    // Cleanup crucial para evitar pantalla blanca
-    return () => {
-      isMountedRef.current = false;
-      if (scannerRef.current) {
-        // Intentar detener si está corriendo
-        if (scannerRef.current.isScanning) {
-            scannerRef.current.stop()
-                .then(() => {
-                    scannerRef.current.clear();
-                })
-                .catch((err: any) => {
-                    // Si falla el stop, forzamos clear
-                    try { scannerRef.current.clear(); } catch(e) {}
-                });
-        } else {
-             try { scannerRef.current.clear(); } catch(e) {}
-        }
-      }
-    };
+    // Pequeño delay para asegurar renderizado del div
+    const t = setTimeout(startScanner, 300);
+    return () => clearTimeout(t);
   }, [isScanning, onScanSuccess]);
 
   return (
-    <div className="w-full max-w-md mx-auto bg-black rounded-lg overflow-hidden relative shadow-2xl">
-      <div id="reader" className="w-full h-80 bg-gray-900"></div>
+    <div className="w-full bg-black rounded-lg overflow-hidden relative shadow-lg">
+      {/* Altura explícita para evitar colapso (el "puntito") */}
+      <div id="reader" className="w-full h-80 bg-black"></div>
       
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/90 text-white p-6 z-10">
-          <div className="text-center">
-             <p className="text-red-400 font-bold mb-2">Error de Cámara</p>
-             <p className="text-sm text-slate-300">{error}</p>
-          </div>
+      {errorMessage && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-900 text-white p-4 text-center z-20">
+          <CameraOff size={32} className="text-red-500 mb-2" />
+          <p className="font-bold">Error de Cámara</p>
+          <p className="text-sm text-slate-400">{errorMessage}</p>
         </div>
       )}
-
-      {/* Loading state visual */}
-      {!permissionGranted && !error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
-            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-emerald-500"></div>
-        </div>
-      )}
-
-      {permissionGranted && !error && (
-        <div className="absolute bottom-4 left-0 right-0 flex justify-center pointer-events-none">
-          <div className="bg-black/60 text-white text-xs px-3 py-1 rounded-full backdrop-blur-sm animate-pulse">
-            Escaneando...
-          </div>
-        </div>
-      )}
-      
-      <div className="absolute inset-0 pointer-events-none border-2 border-white/20 m-8 rounded-lg flex items-center justify-center">
-         <div className="w-64 h-0.5 bg-red-500/50 shadow-[0_0_10px_rgba(239,68,68,0.8)]"></div>
-      </div>
     </div>
   );
 };

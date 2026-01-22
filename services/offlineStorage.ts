@@ -1,105 +1,84 @@
 import { Arete, Lote } from '../types';
+import { db } from './db';
 
-const STORAGE_KEY_OFFLINE_QUEUE = 'ganadoscan_offline_queue_v1';
-const STORAGE_KEY_OFFLINE_LOTES_QUEUE = 'ganadoscan_offline_lotes_queue_v1';
-const STORAGE_KEY_LOTES_CACHE = 'ganadoscan_lotes_cache_v1';
-const STORAGE_KEY_ARETES_CACHE = 'ganadoscan_aretes_cache_v1'; // Nueva clave para aretes del servidor
 const STORAGE_KEY_ACTIVE_LOTE_ID = 'ganadoscan_active_lote_id_v1';
 
 export const OfflineStorage = {
-  // --- COLA DE ARETES OFFLINE (LO QUE TÚ ESCANEAS SIN INTERNET) ---
   
-  agregarACola: (arete: Arete): void => {
-    const queue = OfflineStorage.obtenerCola();
-    if (!queue.find(a => a.id === arete.id)) {
-        const itemToSave = { ...arete, sincronizado: false };
-        localStorage.setItem(STORAGE_KEY_OFFLINE_QUEUE, JSON.stringify([itemToSave, ...queue]));
-    }
-  },
-
-  obtenerCola: (): Arete[] => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_OFFLINE_QUEUE);
-      return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      console.error("Error leyendo cola offline", e);
-      return [];
-    }
-  },
-
-  removerDeCola: (id: string): void => {
-    const queue = OfflineStorage.obtenerCola();
-    const filtered = queue.filter(a => a.id !== id);
-    localStorage.setItem(STORAGE_KEY_OFFLINE_QUEUE, JSON.stringify(filtered));
-  },
-
-  limpiarCola: (): void => {
-    localStorage.removeItem(STORAGE_KEY_OFFLINE_QUEUE);
-  },
-
-  // --- COLA DE LOTES OFFLINE ---
-
-  agregarLoteCola: (lote: Lote): void => {
-    const queue = OfflineStorage.obtenerLotesCola();
-    if (!queue.find(l => l.id === lote.id)) {
-        localStorage.setItem(STORAGE_KEY_OFFLINE_LOTES_QUEUE, JSON.stringify([lote, ...queue]));
-    }
-  },
-
-  obtenerLotesCola: (): Lote[] => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_OFFLINE_LOTES_QUEUE);
-      return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      return [];
-    }
-  },
-
-  removerLoteCola: (id: string): void => {
-    const queue = OfflineStorage.obtenerLotesCola();
-    const filtered = queue.filter(l => l.id !== id);
-    localStorage.setItem(STORAGE_KEY_OFFLINE_LOTES_QUEUE, JSON.stringify(filtered));
-  },
-
-  // --- CACHÉ ESPEJO (DATOS DEL SERVIDOR GUARDADOS LOCALMENTE) ---
+  // --- ARETES ---
   
-  guardarLotesCache: (lotes: Lote[]): void => {
-    try {
-      localStorage.setItem(STORAGE_KEY_LOTES_CACHE, JSON.stringify(lotes));
-    } catch (e) {
-      console.error("Error guardando cache lotes", e);
-    }
+  agregarACola: async (arete: Arete): Promise<void> => {
+    // En IndexedDB, la "cola" es simplemente un registro con sincronizado: false
+    await db.aretes.put({ ...arete, sincronizado: false });
   },
 
-  obtenerLotesCache: (): Lote[] => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_LOTES_CACHE);
-      return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      return [];
-    }
+  obtenerCola: async (): Promise<Arete[]> => {
+    // Buscar todo lo que no esté sincronizado (0 = false)
+    return await db.aretes.where('sincronizado').equals(0).toArray();
   },
 
-  // NUEVO: Guardar todos los aretes del servidor localmente
-  guardarAretesCache: (aretes: Arete[]): void => {
-    try {
-      // Guardamos solo los datos necesarios para ahorrar espacio si son muchos
-      localStorage.setItem(STORAGE_KEY_ARETES_CACHE, JSON.stringify(aretes));
-    } catch (e) {
-      console.error("Error guardando cache aretes", e);
-    }
+  removerDeCola: async (id: string): Promise<void> => {
+    // Marcar como sincronizado en lugar de borrar, para mantener la cache
+    await db.aretes.update(id, { sincronizado: true });
   },
 
-  obtenerAretesCache: (): Arete[] => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY_ARETES_CACHE);
-      return stored ? JSON.parse(stored) : [];
-    } catch (e) {
-      return [];
-    }
+  eliminarLocalmente: async (id: string): Promise<void> => {
+      await db.aretes.delete(id);
   },
 
-  // --- PERSISTENCIA DE LOTE ACTIVO (STICKY SESSION) ---
+  // --- LOTES ---
+
+  agregarLoteCola: async (lote: Lote): Promise<void> => {
+    await db.lotes.put({ ...lote, sincronizado: false } as any);
+  },
+
+  obtenerLotesCola: async (): Promise<Lote[]> => {
+    return await db.lotes.where('sincronizado').equals(0).toArray();
+  },
+
+  removerLoteCola: async (id: string): Promise<void> => {
+    await db.lotes.update(id, { sincronizado: true } as any);
+  },
+
+  eliminarLoteLocalmente: async (id: string): Promise<void> => {
+    await (db as any).transaction('rw', db.lotes, db.aretes, async () => {
+        await db.lotes.delete(id);
+        // También borrar aretes asociados
+        await db.aretes.where('loteId').equals(id).delete();
+    });
+  },
+
+  // --- CACHÉ GENERAL (LECTURA/ESCRITURA MASIVA) ---
+  
+  // Guardar lo que viene del servidor (upsert masivo)
+  guardarLotesCache: async (lotes: Lote[]): Promise<void> => {
+    const lotesConSync = lotes.map(l => ({ ...l, sincronizado: true }));
+    await db.lotes.bulkPut(lotesConSync as any);
+  },
+
+  obtenerTodosLotes: async (): Promise<Lote[]> => {
+    return await db.lotes.orderBy('fechaCreacion').reverse().toArray();
+  },
+
+  guardarAretesCache: async (aretes: Arete[]): Promise<void> => {
+    const aretesConSync = aretes.map(a => ({ ...a, sincronizado: true }));
+    await db.aretes.bulkPut(aretesConSync);
+  },
+
+  obtenerTodosAretes: async (): Promise<Arete[]> => {
+    return await db.aretes.orderBy('fechaEscaneo').reverse().toArray();
+  },
+
+  actualizarAreteLocal: async (id: string, changes: Partial<Arete>): Promise<void> => {
+      await db.aretes.update(id, changes);
+  },
+
+  actualizarLoteLocal: async (id: string, changes: Partial<Lote>): Promise<void> => {
+      await db.lotes.update(id, changes);
+  },
+
+  // --- PERSISTENCIA DE LOTE ACTIVO (MANTENEMOS LOCALSTORAGE POR SIMPLICIDAD UI) ---
+  // Guardar un string pequeño en localStorage es más eficiente para el estado inicial de la UI
   
   guardarLoteActivo: (id: string | null): void => {
       if (id) {
